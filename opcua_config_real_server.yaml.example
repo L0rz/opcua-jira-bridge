@@ -1,0 +1,115 @@
+# ============================================================
+# Beispiel-Konfiguration für einen echten OPC UA Server
+# ============================================================
+# Kopieren nach: opcua_config.yaml und anpassen
+
+server:
+  # Endpoint des echten OPC UA Servers
+  # Format: opc.tcp://<hostname>:<port>/<pfad>
+  endpoint: "opc.tcp://192.168.1.100:4840"
+
+  timeout: 10
+  reconnect_interval: 10
+
+  # --- Mit Username/Passwort ---
+  auth_mode: username
+  username: "opcua_user"
+  password: "geheim"
+
+  # --- Mit Zertifikat (für verschlüsselte Verbindung) ---
+  # auth_mode: certificate
+  # certificate_path: "/certs/client_cert.pem"
+  # private_key_path: "/certs/client_key.pem"
+  # server_certificate_path: "/certs/server_cert.pem"
+  # security_policy: Basic256Sha256
+  # security_mode: SignAndEncrypt
+
+  # --- Anonymous (kein Auth) ---
+  # auth_mode: anonymous
+
+
+namespace:
+  # Für echte Server empfohlen: URI-Discovery
+  # Die URI findest du in der Server-Dokumentation oder per UAExpert-Tool
+  discovery_mode: uri
+  uri: "urn:my-plc:UA:MyApplication"
+
+  # Fallback wenn URI nicht gefunden wird
+  index: 2
+
+
+nodes:
+  # ── Alarm-Trigger ───────────────────────────────────────────
+  # Der Node der TRUE wird wenn ein Alarm vorliegt
+  # NodeId findest du mit UAExpert oder OPC UA Browser
+  alarm_active:
+    method: nodeid
+    nodeid: "ns=2;s=Alarms.AlarmActive"
+    # oder numerisch: "ns=2;i=1001"
+
+  # ── Alarm-Details ───────────────────────────────────────────
+  alarm_message:
+    method: nodeid
+    nodeid: "ns=2;s=Alarms.AlarmMessage"
+    enabled: true
+    label: "Alarmmeldung"
+
+  error_code:
+    method: nodeid
+    nodeid: "ns=2;s=Alarms.ErrorCode"
+    enabled: true
+    label: "Fehlercode"
+
+  # ── Prozesswerte (optional) ──────────────────────────────────
+  temperature:
+    method: nodeid
+    nodeid: "ns=2;s=Process.Temperature"
+    enabled: true
+    label: "Temperatur"
+    unit: "°C"
+
+  pressure:
+    method: nodeid
+    nodeid: "ns=2;s=Process.Pressure"
+    enabled: true
+    label: "Druck"
+    unit: "bar"
+
+  # ── Weitere eigene Nodes ─────────────────────────────────────
+  # machine_status:
+  #   method: nodeid
+  #   nodeid: "ns=2;s=Machine.Status"
+  #   enabled: true
+  #   label: "Maschinenstatus"
+  #
+  # production_count:
+  #   method: nodeid
+  #   nodeid: "ns=2;i=1042"
+  #   enabled: true
+  #   label: "Stückzähler"
+  #   unit: "Stk"
+
+
+alarm:
+  # Was löst das Ticket aus? true für Bool-Nodes, oder z.B. 1 für Int-Nodes
+  trigger_value: true
+  dedup_cooldown: 300
+
+  priority_map:
+    0: Low
+    1: Medium
+    2: High
+    3: Highest
+    default: Medium
+
+
+jira:
+  issue_type: "Incident"
+  auto_assign: true
+  summary_template: "[OPC UA Alarm] {alarm_message}"
+  labels:
+    - "opcua"
+    - "automated"
+    - "production"
+  # custom_fields:
+  #   customfield_10001: "Produktion Linie 1"

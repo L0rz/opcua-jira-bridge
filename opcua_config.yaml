@@ -1,0 +1,176 @@
+# ============================================================
+# OPC UA → Jira Bridge — Serverkonfiguration
+# ============================================================
+# Diese Datei konfiguriert die Verbindung zu einem echten OPC UA Server.
+# Für den eingebauten Test-Server (opcua_server.py) sind die Standardwerte korrekt.
+
+server:
+  # OPC UA Endpoint des Servers
+  endpoint: "opc.tcp://localhost:4840/freeopcua/server/"
+
+  # Verbindungstimeout in Sekunden
+  timeout: 10
+
+  # Reconnect-Intervall bei Verbindungsabbruch (Sekunden)
+  reconnect_interval: 5
+
+  # -------------------------
+  # Authentifizierung
+  # -------------------------
+  # Modus: anonymous | username | certificate
+  auth_mode: anonymous
+
+  # Für auth_mode: username
+  username: ""
+  password: ""
+
+  # Für auth_mode: certificate
+  # certificate_path: "/path/to/client_cert.pem"
+  # private_key_path: "/path/to/client_key.pem"
+  # server_certificate_path: "/path/to/server_cert.pem"
+
+  # Security Policy: None | Basic128Rsa15 | Basic256 | Basic256Sha256
+  security_policy: None
+
+  # Security Mode: None | Sign | SignAndEncrypt
+  security_mode: None
+
+
+# ============================================================
+# Namespace-Konfiguration
+# ============================================================
+namespace:
+  # Methode: uri | index | auto
+  #   uri:   Namespace-URI wird gesucht (empfohlen für echte Server)
+  #   index: Direkter Namespace-Index (z.B. 2)
+  #   auto:  Versucht uri, fällt auf index zurück
+  discovery_mode: uri
+
+  # URI des OPC UA Namespaces (für discovery_mode: uri oder auto)
+  uri: "http://opcua-jira-bridge.test"
+
+  # Direkter Index (für discovery_mode: index oder als Fallback)
+  index: 2
+
+
+# ============================================================
+# Node-Konfiguration
+# ============================================================
+# Wie werden die Nodes gefunden?
+#   browse_path: Relativer Pfad vom Objects-Knoten (Standard für Test-Server)
+#   nodeid:      Direkter NodeId (empfohlen für echte Server, z.B. "ns=2;s=AlarmActive")
+#
+# NodeId-Formate:
+#   Numerisch:   "ns=2;i=1001"
+#   String:      "ns=2;s=MyAlarmNode"
+#   GUID:        "ns=2;g=12345678-1234-1234-1234-123456789012"
+#   ByteString:  "ns=2;b=M/RbKBsRVkePCePcx24oRA=="
+#
+# Browse-Pfad Format: ["ParentObject", "ChildNode"]
+# (mit automatischer Namespace-Präfix-Erweiterung)
+
+nodes:
+  # ---- Pflichtfeld: Alarm-Trigger-Node ----
+  # Dieser Node wird subscribed. Wenn er TRUE wird → Jira Ticket
+  alarm_active:
+    method: browse_path
+    browse_path: ["IndustrialPlant", "AlarmActive"]
+    # Alternativ mit NodeId:
+    # method: nodeid
+    # nodeid: "ns=2;s=AlarmActive"
+
+  # ---- Optionale Datennodes ----
+  # Diese Werte werden beim Alarm ausgelesen und ins Ticket geschrieben
+  # Nicht benötigte Nodes können auskommentiert oder auf enabled: false gesetzt werden
+
+  alarm_message:
+    method: browse_path
+    browse_path: ["IndustrialPlant", "AlarmMessage"]
+    enabled: true
+    label: "Alarmmeldung"
+    # nodeid: "ns=2;s=AlarmMessage"
+
+  error_code:
+    method: browse_path
+    browse_path: ["IndustrialPlant", "ErrorCode"]
+    enabled: true
+    label: "Fehlercode"
+    # nodeid: "ns=2;s=ErrorCode"
+
+  temperature:
+    method: browse_path
+    browse_path: ["IndustrialPlant", "Temperature"]
+    enabled: true
+    label: "Temperatur"
+    unit: "°C"
+    # nodeid: "ns=2;s=Temperature"
+
+  pressure:
+    method: browse_path
+    browse_path: ["IndustrialPlant", "Pressure"]
+    enabled: true
+    label: "Druck"
+    unit: "bar"
+    # nodeid: "ns=2;s=Pressure"
+
+  # ---- Beliebige zusätzliche Nodes ----
+  # Können einfach hinzugefügt werden:
+  #
+  # motor_speed:
+  #   method: nodeid
+  #   nodeid: "ns=3;i=1005"
+  #   enabled: true
+  #   label: "Motordrehzahl"
+  #   unit: "RPM"
+  #
+  # valve_status:
+  #   method: browse_path
+  #   browse_path: ["Machine", "Valve1", "Status"]
+  #   enabled: true
+  #   label: "Ventil 1 Status"
+
+
+# ============================================================
+# Alarm-Erkennung
+# ============================================================
+alarm:
+  # Welcher Wert des alarm_active-Nodes löst einen Alarm aus?
+  # true für Boolean-Nodes, oder ein numerischer Wert z.B. 1
+  trigger_value: true
+
+  # Dedup: Gleicher Alarm wird nicht doppelt gemeldet (in Sekunden)
+  dedup_cooldown: 300
+
+  # Priority-Mapping basierend auf error_code-Wert
+  # 0 = OK, 1 = Warning, 2 = Critical, 3 = Emergency
+  priority_map:
+    0: Low
+    1: Medium
+    2: High
+    3: Highest
+    default: Medium
+
+
+# ============================================================
+# Jira-Ticket Konfiguration
+# ============================================================
+jira:
+  # Issue-Type (muss im Projekt existieren)
+  # Häufige Werte: Bug, Task, Incident, Story
+  issue_type: "Incident"
+
+  # Soll der API-User automatisch als Assignee gesetzt werden?
+  auto_assign: true
+
+  # Ticket-Summary Template
+  # Verfügbare Variablen: {alarm_message}, {error_code}, {node_name}
+  summary_template: "[OPC UA Alarm] {alarm_message}"
+
+  # Labels (optional)
+  labels:
+    - "opcua"
+    - "automated"
+
+  # Zusätzliche Jira-Felder (optional)
+  # custom_fields:
+  #   customfield_10001: "Wert"
