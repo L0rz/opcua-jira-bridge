@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  opcua-server:
+    build: .
+    container_name: opcua-server
+    command: python opcua_server.py
+    ports:
+      - "4840:4840"
+    networks:
+      - bridge-net
+    restart: unless-stopped
+
+  opcua-bridge:
+    build: .
+    container_name: opcua-bridge
+    command: python opcua_jira_bridge.py
+    env_file: .env
+    environment:
+      - OPCUA_ENDPOINT=opc.tcp://opcua-server:4840/freeopcua/server/
+    depends_on:
+      - opcua-server
+    networks:
+      - bridge-net
+    restart: unless-stopped
+
+  api:
+    build: .
+    container_name: opcua-api
+    command: python api.py
+    env_file: .env
+    ports:
+      - "8080:8080"
+    depends_on:
+      - opcua-bridge
+    networks:
+      - bridge-net
+    restart: unless-stopped
+
+networks:
+  bridge-net:
+    driver: bridge
