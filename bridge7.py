@@ -73,7 +73,8 @@ async def create_jira_ticket(alarm_key: str, alarm_label: str, priority: str,
         log.info("Dedup: skipping %s", alarm_key)
         return None
 
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    from datetime import timezone
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     client_id = context.get("client_id", "n/a")
     room_id   = context.get("room_id", "n/a")
 
