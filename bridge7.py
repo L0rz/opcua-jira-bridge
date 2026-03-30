@@ -221,9 +221,10 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
 
     while True:
         try:
-            client = Client(url=endpoint, timeout=30)
+            client = Client(url=endpoint, timeout=5)
             client.session_timeout = 3600000
             client._watchdog_intervall = 999999
+            client.secure_channel_timeout = 600000  # 10 min
 
             if server_cfg.get("auth_mode") == "username":
                 u = os.getenv("OPCUA_USERNAME") or server_cfg.get("username", "")
@@ -232,11 +233,11 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
                 client.set_password(p)
                 log.info("Auth: %s", u)
 
-            # Discovery
-            endpoints = await client.connect_and_get_server_endpoints()
-            log.info("Discovery: %d endpoint(s)", len(endpoints))
+            # Direct connect (skip discovery — we already know the endpoint)
+            await client.connect()
+            log.info("Connected directly")
 
-            async with client:
+            try:
                 log.info("Connected")
                 ns_idx = ns_cfg.get("index", 2)
 
@@ -280,6 +281,12 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
                         await asyncio.sleep(0.05)
 
                     await asyncio.sleep(poll_interval)
+
+            finally:
+                try:
+                    await client.disconnect()
+                except:
+                    pass
 
         except Exception as e:
             log.error("Connection error: %s — Retry in %ds", e, reconnect)
