@@ -50,6 +50,9 @@ alarm:
   # Default-Priority für auto-discovered Alarme
   default_priority: "High"
 
+  # Poll-Intervall in Sekunden (Elipse E3 unterstützt keine Subscriptions)
+  poll_interval: 5
+
   # Ticket automatisch auf "Gelöst" setzen wenn Alarm wieder false
   auto_resolve: true
 
