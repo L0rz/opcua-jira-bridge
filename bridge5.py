@@ -89,14 +89,14 @@ async def create_jira_ticket(alarm_cfg: dict, context: dict, jira_cfg: dict, ala
         client_id=client_id, room_id=room_id,
     )[:255]
 
-    rows = f"||Parameter||Wert||\n|Zeitstempel|{ts}|\n|Alarm-Key|{alarm_key}|\n"
+    rows = f"||Parameter||Value||\n|Timestamp|{ts}|\n|Alarm Key|{alarm_key}|\n"
     for k, v in context.items():
         rows += f"|{k}|{v}|\n"
 
     description = (
-        f"*Automatisch erstellt durch OPC UA → Jira Bridge*\n\n"
+        f"*Automatically created by OPC UA to Jira Bridge*\n\n"
         f"*Alarm:* {alarm_desc}\n\n{rows}\n"
-        f"Bitte umgehend prüfen und Maßnahmen einleiten."
+        f"Please check and take corrective action immediately."
     )
 
     payload: dict = {
@@ -135,7 +135,7 @@ async def resolve_jira_ticket(alarm_key: str, alarm_cfg_global: dict) -> bool:
         return False
 
     transition_id = str(alarm_cfg_global.get("resolve_transition_id", "5"))
-    comment = alarm_cfg_global.get("resolve_comment", "Alarm automatisch gelöst.")
+    comment = alarm_cfg_global.get("resolve_comment", "Alarm automatically resolved.")
     issue_key = ticket["key"]
 
     await _jira_post(f"/rest/api/2/issue/{issue_key}/transitions", {"transition": {"id": transition_id}})

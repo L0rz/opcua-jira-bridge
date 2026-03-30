@@ -90,7 +90,7 @@ alarm:
   # Jira Transition ID für "Gelöst"
   # Mögliche Werte holen via: GET /rest/api/2/issue/{issueKey}/transitions
   resolve_transition_id: "5"    # RKS Projekt: 5 = "Resolve Issue" → Status "Resolved"
-  resolve_comment: "Alarm automatisch gelöst: OPC UA Node zurück auf FALSE."
+  resolve_comment: "Alarm automatically resolved: OPC UA Node returned to FALSE."
 
 
 # ============================================================
