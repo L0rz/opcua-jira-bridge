@@ -297,7 +297,7 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
         try:
             client = Client(url=endpoint, timeout=15)
             client.session_timeout = 60000
-            client.watchdog_intervall = 0
+            client._watchdog_intervall = 0  # Private attr in asyncua 1.1.x
 
             auth_mode = server_cfg.get("auth_mode", "anonymous")
             if auth_mode == "username":
