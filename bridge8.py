@@ -134,8 +134,8 @@ async def resolve_jira_ticket(alarm_key: str, alarm_cfg: dict) -> bool:
 
 
 async def quick_connect(endpoint: str, server_cfg: dict) -> Client:
-    """Connect, return client. Caller must disconnect."""
-    client = Client(url=endpoint, timeout=5)
+    """Connect via discovery handshake, return client. Caller must disconnect."""
+    client = Client(url=endpoint, timeout=10)
     client.session_timeout = 30000
     client._watchdog_intervall = 999999
     if server_cfg.get("auth_mode") == "username":
@@ -143,6 +143,9 @@ async def quick_connect(endpoint: str, server_cfg: dict) -> Client:
         p = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
         client.set_user(u)
         client.set_password(p)
+    # Discovery handshake required by Elipse E3
+    await client.connect_and_get_server_endpoints()
+    # Now connect for real (on same client object)
     await client.connect()
     return client
 
