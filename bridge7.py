@@ -191,6 +191,19 @@ async def read_context(client: Client, root_path: str, ns_idx: int, room_id_node
     return ctx
 
 
+async def _handle_alarm(client, info, ns_idx, root_paths, jira_cfg, alarm_cfg):
+    """Background task for alarm handling — does not block poll loop."""
+    try:
+        context = await read_context(
+            client, info["root_path"], ns_idx, info.get("room_id_node"))
+        await create_jira_ticket(
+            info["key"], info["label"],
+            alarm_cfg.get("default_priority", "High"),
+            context, jira_cfg, alarm_cfg)
+    except Exception as e:
+        log.error("Error creating ticket for %s: %s", info["key"], e)
+
+
 async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
     cfg = load_config(config_path)
     server_cfg = cfg.get("server", {})
@@ -250,17 +263,15 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
 
                             if val is True and prev is not True:
                                 log.info("ALARM [%s] ACTIVE", alarm_key)
-                                context = await read_context(
-                                    client, info["root_path"], ns_idx, info.get("room_id_node"))
-                                await create_jira_ticket(
-                                    alarm_key, info["label"],
-                                    alarm_cfg.get("default_priority", "High"),
-                                    context, jira_cfg, alarm_cfg)
+                                # Background task — don't block poll loop!
+                                asyncio.get_event_loop().create_task(
+                                    _handle_alarm(client, info, ns_idx, root_paths, jira_cfg, alarm_cfg))
 
                             elif val is False and prev is True:
                                 log.info("ALARM [%s] RESOLVED", alarm_key)
                                 if alarm_cfg.get("auto_resolve", True):
-                                    await resolve_jira_ticket(alarm_key, alarm_cfg)
+                                    asyncio.get_event_loop().create_task(
+                                        resolve_jira_ticket(alarm_key, alarm_cfg))
 
                             prev_state[alarm_key] = val
                         except Exception as e:
