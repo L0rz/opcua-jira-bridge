@@ -296,12 +296,11 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
 
     while True:
         try:
-            client = Client(url=endpoint, timeout=15)
-            client.session_timeout = 60000
-            # Disable watchdog completely (Elipse E3 drops watchdog reads)
-            client._watchdog_intervall = 0
-            async def _noop_monitor(): pass
-            client._monitor_server_loop = _noop_monitor
+            client = Client(url=endpoint, timeout=30)
+            client.session_timeout = 3600000  # 1 Stunde
+            # Disable watchdog (Elipse E3 drops watchdog reads)
+            # Set very high interval so it never fires
+            client._watchdog_intervall = 999999
 
             auth_mode = server_cfg.get("auth_mode", "anonymous")
             if auth_mode == "username":
