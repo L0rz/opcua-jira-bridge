@@ -198,6 +198,7 @@ async def discover_alarm_nodes(client: Client, root_path: str, ns_idx: int) -> l
                     "room_id_node": room_id_node,
                 })
                 log.info("  Alarm: [%s] = %s", alarm_key, val)
+                await asyncio.sleep(0.1)  # Throttle reads for Elipse E3
             except Exception as e:
                 log.warning("  Could not read alarm %s: %s", alarm_key, e)
 
@@ -297,7 +298,10 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
         try:
             client = Client(url=endpoint, timeout=15)
             client.session_timeout = 60000
-            client._watchdog_intervall = 0  # Private attr in asyncua 1.1.x
+            # Disable watchdog completely (Elipse E3 drops watchdog reads)
+            client._watchdog_intervall = 0
+            async def _noop_monitor(): pass
+            client._monitor_server_loop = _noop_monitor
 
             auth_mode = server_cfg.get("auth_mode", "anonymous")
             if auth_mode == "username":
