@@ -168,13 +168,15 @@ async def discover_alarms(client: Client, root_path: str, ns_idx: int) -> list[d
             elif name == "MISC":
                 for mc in await child.get_children():
                     if (await mc.read_browse_name()).Name == "ROOM_ID":
-                        room_id_nodeid = str(mc.nodeid)
+                        rid = mc.nodeid
+                        room_id_nodeid = f"ns={rid.NamespaceIndex};s={rid.Identifier}"
         if not alarms_folder:
             continue
         for alarm_node in await alarms_folder.get_children():
             alarm_name = (await alarm_node.read_browse_name()).Name
+            nid = alarm_node.nodeid
             alarms.append({
-                "nodeid": str(alarm_node.nodeid),
+                "nodeid": f"ns={nid.NamespaceIndex};s={nid.Identifier}",
                 "key": f"{room_name}.{alarm_name}",
                 "label": alarm_name,
                 "room_name": room_name,
