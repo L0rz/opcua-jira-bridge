@@ -189,7 +189,6 @@ async def discover_alarm_nodes(client: Client, root_path: str, ns_idx: int) -> l
             alarm_name = (await alarm_node.read_browse_name()).Name
             alarm_key = f"{room_name}.{alarm_name}"
             try:
-                val = await alarm_node.read_value()
                 alarms.append({
                     "node": alarm_node,
                     "key": alarm_key,
@@ -197,10 +196,9 @@ async def discover_alarm_nodes(client: Client, root_path: str, ns_idx: int) -> l
                     "room_name": room_name,
                     "room_id_node": room_id_node,
                 })
-                log.info("  Alarm: [%s] = %s", alarm_key, val)
-                await asyncio.sleep(0.1)  # Throttle reads for Elipse E3
+                log.info("  Alarm: [%s]", alarm_key)
             except Exception as e:
-                log.warning("  Could not read alarm %s: %s", alarm_key, e)
+                log.warning("  Could not add alarm %s: %s", alarm_key, e)
 
     return alarms
 
@@ -338,48 +336,15 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
 
                 log.info("Total alarm nodes discovered: %d", len(all_alarm_nodes))
 
-                # Polling statt Subscription (Elipse E3 unterstützt keine Subscriptions)
-                poll_interval = cfg.get("alarm", {}).get("poll_interval", 5)
-                jira_cfg = cfg.get("jira", {})
-                alarm_cfg = cfg.get("alarm", {})
-                log.info("Polling %d alarm node(s) every %ds...", len(all_alarm_nodes), poll_interval)
-
-                # Track previous state for edge detection
-                prev_state: dict[str, bool] = {}
+                # Subscription SOFORT erstellen (vor den Reads!)
+                handler = AutoAlarmHandler(client, alarm_map, root_paths[0], ns_idx, cfg)
+                sub = await client.create_subscription(1000, handler)
+                log.info("Subscription created")
+                await sub.subscribe_data_change(all_alarm_nodes)
+                log.info("Subscribed to %d alarm node(s) - waiting for alarms...", len(all_alarm_nodes))
 
                 while True:
-                    for node in all_alarm_nodes:
-                        nid = str(node.nodeid)
-                        info = alarm_map[nid]
-                        try:
-                            val = await node.read_value()
-                            alarm_key = info["key"]
-                            prev = prev_state.get(alarm_key)
-
-                            if val is True and prev is not True:
-                                # Rising edge: alarm triggered
-                                log.info("ALARM [%s] ACTIVE", alarm_key)
-                                context = await read_context(
-                                    client, info.get("root_path", root_paths[0]),
-                                    ns_idx, info.get("room_id_node"),
-                                )
-                                await create_jira_ticket(
-                                    alarm_key, info["label"],
-                                    alarm_cfg.get("default_priority", "High"),
-                                    context, jira_cfg, alarm_cfg,
-                                )
-                            elif val is False and prev is True:
-                                # Falling edge: alarm resolved
-                                log.info("ALARM [%s] RESOLVED", alarm_key)
-                                if alarm_cfg.get("auto_resolve", True):
-                                    await resolve_jira_ticket(alarm_key, alarm_cfg)
-
-                            prev_state[alarm_key] = val
-                        except Exception as e:
-                            log.warning("Could not read %s: %s", info["key"], e)
-                        await asyncio.sleep(0.05)  # Small delay between reads
-
-                    await asyncio.sleep(poll_interval)
+                    await asyncio.sleep(1)
 
         except Exception as e:
             log.error("Connection error: %s - Retry in %ds...", e, reconnect)
