@@ -251,7 +251,7 @@ class MultiAlarmHandler:
 
     def datachange_notification(self, node, val, data):
         loop = asyncio.get_event_loop()
-        node_id = str(node.nodeid)
+        node_id = str(node.nodeid) if hasattr(node, 'nodeid') else str(node)
 
         alarm_def = self.node_to_alarm.get(node_id)
         if alarm_def is None:
@@ -300,24 +300,28 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
 
     while True:
         try:
-            client = Client(url=endpoint, timeout=server_cfg.get("timeout", 10))
-
-            # Auth
+            # Discovery-Client (separater Client, wird danach verworfen)
             auth_mode = server_cfg.get("auth_mode", "anonymous")
+            username = os.getenv("OPCUA_USERNAME") or server_cfg.get("username", "")
+            password = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
+
+            try:
+                disc = Client(url=endpoint, timeout=15)
+                if auth_mode == "username":
+                    disc.set_user(username)
+                    disc.set_password(password)
+                endpoints = await disc.connect_and_get_server_endpoints()
+                log.info("Discovery: %d Endpoint(s) gefunden", len(endpoints))
+                await disc.disconnect()
+            except Exception as e:
+                log.warning("Endpoint-Discovery fehlgeschlagen: %s", e)
+
+            # Eigentlicher Client
+            client = Client(url=endpoint, timeout=server_cfg.get("timeout", 10))
             if auth_mode == "username":
-                username = os.getenv("OPCUA_USERNAME") or server_cfg.get("username", "")
-                password = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
                 client.set_user(username)
                 client.set_password(password)
                 log.info("Auth: %s", username)
-
-            # Endpoint-Discovery VOR dem Connect (Elipse E3 Server erfordert das)
-            try:
-                endpoints = await client.connect_and_get_server_endpoints()
-                log.info("Discovery: %d Endpoint(s) gefunden", len(endpoints))
-                await client.disconnect()
-            except Exception as e:
-                log.warning("Endpoint-Discovery fehlgeschlagen: %s — versuche direkten Connect", e)
 
             async with client:
                 log.info("✅ Verbunden mit OPC UA Server")
@@ -334,7 +338,7 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
                             node = resolve_node_by_id(client, alarm_def["nodeid"])
                         else:
                             node = await resolve_node_by_path(client, alarm_def["browse_path"], ns_idx)
-                        nid  = str((await node.read_node_id()))
+                        nid  = str(node.nodeid)
                         alarm_nodes[nid] = alarm_def
                         alarm_node_objs.append(node)
                         log.info("Alarm-Node [%s] → %s", alarm_def["key"], nid)
