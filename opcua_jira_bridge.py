@@ -311,6 +311,14 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
                 client.set_password(password)
                 log.info("Auth: %s", username)
 
+            # Endpoint-Discovery VOR dem Connect (Elipse E3 Server erfordert das)
+            try:
+                endpoints = await client.connect_and_get_server_endpoints()
+                log.info("Discovery: %d Endpoint(s) gefunden", len(endpoints))
+                await client.disconnect()
+            except Exception as e:
+                log.warning("Endpoint-Discovery fehlgeschlagen: %s — versuche direkten Connect", e)
+
             async with client:
                 log.info("✅ Verbunden mit OPC UA Server")
                 ns_idx = await discover_namespace(client, ns_cfg)
