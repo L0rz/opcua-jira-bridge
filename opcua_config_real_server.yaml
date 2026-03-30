@@ -51,7 +51,7 @@ alarm:
   default_priority: "High"
 
   # Poll-Intervall in Sekunden (Elipse E3 braucht ~8s Pause zwischen Connects)
-  poll_interval: 10
+  poll_interval: 15
 
   # Ticket automatisch auf "Gelöst" setzen wenn Alarm wieder false
   auto_resolve: true
