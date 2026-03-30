@@ -192,10 +192,13 @@ async def run_bridge(config_path):
             values = await client.read_values(nodes)
             await client.disconnect()
 
+            # Let socket fully close before doing ANYTHING else
+            await asyncio.sleep(2)
+
             consecutive_errors = 0
             poll_count += 1
 
-            # Process AFTER disconnect
+            # Process AFTER disconnect + cleanup
             for i, val in enumerate(values):
                 prev = prev_state.get(alarm_keys[i])
                 if val is True and prev is not True:
