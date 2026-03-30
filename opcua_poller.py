@@ -182,11 +182,12 @@ async def discover_alarm_nodes(
             log.warning("Root path '%s' not found: %s", root_path, exc)
             continue
 
-        # Browse ROOMS
+        # Browse DataStructure → ROOMS
         try:
-            rooms_node = await root_node.get_child(f"{ns_index}:ROOMS")
+            ds_node = await root_node.get_child(f"{ns_index}:DataStructure")
+            rooms_node = await ds_node.get_child(f"{ns_index}:ROOMS")
         except Exception as exc:
-            log.warning("No ROOMS under '%s': %s", root_path, exc)
+            log.warning("No DataStructure/ROOMS under '%s': %s", root_path, exc)
             continue
 
         room_children = await rooms_node.get_children()
