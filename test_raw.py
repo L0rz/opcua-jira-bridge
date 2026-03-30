@@ -1,7 +1,9 @@
 """
 Raw Socket Test - schaut was der Server auf Port 48010 wirklich spricht
+Probiert verschiedene Endpoint-URL Varianten im HEL
 """
 import socket
+import struct
 import sys
 
 host = "localhost"
@@ -14,52 +16,67 @@ if len(sys.argv) > 1:
 
 print(f"Raw Test → {host}:{port}\n{'='*60}")
 
-# OPC UA Hello Message (HEL)
-# Magic: "HELF" + chunk type + message size + protocol version + buffer sizes + endpoint
-HEL = (
-    b"HELF"          # MessageType = HEL, ChunkType = F (final)
-    + b"\x00" * 4   # MessageSize placeholder (wird unten gefüllt)
-    + b"\x00\x00\x00\x00"   # ProtocolVersion = 0
-    + b"\x00\x00\x04\x00"   # ReceiveBufferSize = 262144 (little endian: 0x00040000)
-    + b"\x00\x00\x04\x00"   # SendBufferSize    = 262144
-    + b"\x00\x00\x00\x00"   # MaxMessageSize    = 0 (unlimited)
-    + b"\x00\x00\x00\x00"   # MaxChunkCount     = 0 (unlimited)
-    + b"\x1a\x00"           # EndpointUrl length = 26
-    + b"opc.tcp://localhost:48010"  # EndpointUrl
-)
-# Größe einsetzen (little endian uint32)
-import struct
-size = len(HEL)
-HEL = HEL[:4] + struct.pack("<I", size) + HEL[8:]
 
-print(f"Sende OPC UA HEL ({len(HEL)} bytes)...")
+def make_hel(endpoint_url: str) -> bytes:
+    url_bytes = endpoint_url.encode("utf-8")
+    url_len = struct.pack("<I", len(url_bytes))
+    body = (
+        struct.pack("<I", 0)           # ProtocolVersion
+        + struct.pack("<I", 65536)     # ReceiveBufferSize
+        + struct.pack("<I", 65536)     # SendBufferSize
+        + struct.pack("<I", 0)         # MaxMessageSize
+        + struct.pack("<I", 0)         # MaxChunkCount
+        + url_len
+        + url_bytes
+    )
+    header = b"HELF" + struct.pack("<I", 8 + len(body))
+    return header + body
 
-s = socket.socket()
-s.settimeout(5)
-try:
-    s.connect((host, port))
-    print("✅ TCP verbunden")
-    s.send(HEL)
-    response = s.recv(4096)
-    print(f"✅ Antwort ({len(response)} bytes): {response[:4]}")
-    if response[:3] == b"ACK":
-        print("→ Server spricht OPC UA Binary! ACK erhalten.")
-        print("→ Problem liegt in asyncua Library")
-    elif response[:3] == b"ERR":
-        err_code = struct.unpack("<I", response[8:12])[0] if len(response) >= 12 else 0
-        print(f"→ Server antwortete mit ERROR: Code 0x{err_code:08X}")
-    else:
-        print(f"→ Unbekannte Antwort: {response[:20]}")
-except socket.timeout:
-    print("❌ Timeout — Server antwortet nicht auf OPC UA HEL")
-    print("→ Port 48010 ist offen aber spricht kein OPC UA Binary!")
-    print("→ Evtl. falscher Port oder Server braucht anderen Transport")
-except Exception as e:
-    print(f"❌ Fehler: {e}")
-finally:
-    s.close()
 
-# Auch schauen was asyncua Version ist
+def send_hel(endpoint_url: str) -> str:
+    hel = make_hel(endpoint_url)
+    s = socket.socket()
+    s.settimeout(5)
+    try:
+        s.connect((host, port))
+        s.send(hel)
+        response = s.recv(4096)
+        if response[:3] == b"ACK":
+            return "✅ ACK — Server akzeptiert diese URL!"
+        elif response[:3] == b"ERR":
+            code = struct.unpack("<I", response[8:12])[0] if len(response) >= 12 else 0
+            return f"❌ ERR 0x{code:08X}"
+        else:
+            return f"❓ Unbekannt: {response[:8]}"
+    except socket.timeout:
+        return "❌ Timeout"
+    except Exception as e:
+        return f"❌ {e}"
+    finally:
+        s.close()
+
+
+# Verschiedene URL-Varianten testen
+variants = [
+    f"opc.tcp://{host}:{port}",
+    f"opc.tcp://{host}:{port}/",
+    f"opc.tcp://{host.upper()}:{port}",
+    f"opc.tcp://{host.lower()}:{port}",
+    f"opc.tcp://localhost:{port}",
+    f"opc.tcp://127.0.0.1:{port}",
+    f"opc.tcp://{host}:{port}/OPCUA/SimulationServer",
+    f"opc.tcp://{host}:{port}/UA/Server",
+    f"opc.tcp://{host}:{port}/opcua",
+]
+
+for url in variants:
+    result = send_hel(url)
+    print(f"  {result:45s} ← {url}")
+    if "ACK" in result:
+        print(f"\n✅ FUNKTIONIERENDE URL: {url}")
+        print(f"→ Bitte .env und opcua_config_real_server.yaml auf diese URL setzen!")
+        break
+
 print("\nasyncua Version:")
 try:
     import asyncua
