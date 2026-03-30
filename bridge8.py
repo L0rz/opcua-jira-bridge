@@ -143,9 +143,6 @@ async def quick_connect(endpoint: str, server_cfg: dict) -> Client:
         p = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
         client.set_user(u)
         client.set_password(p)
-    # Discovery handshake required by Elipse E3
-    await client.connect_and_get_server_endpoints()
-    # Now connect for real (on same client object)
     await client.connect()
     return client
 
