@@ -3,7 +3,7 @@
 # ============================================================
 
 server:
-  endpoint: "opc.tcp://localhost:48010"
+  endpoint: "opc.tcp://Deltafrigo:48010"
   timeout: 10
   reconnect_interval: 5
 
