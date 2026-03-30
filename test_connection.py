@@ -7,75 +7,78 @@ Verwendung: python test_connection.py [opc.tcp://host:port]
 import asyncio
 import sys
 from asyncua import Client
+from asyncua.ua import MessageSecurityMode
+from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
 
 URL = sys.argv[1] if len(sys.argv) > 1 else "opc.tcp://localhost:48010"
 
 
-async def try_connect(label: str, setup_fn):
+async def try_connect(label: str, client: Client):
     print(f"\n▶ Teste: {label}")
     try:
-        client = setup_fn()
-        async with client:
-            ns = await client.get_namespace_array()
-            print(f"  ✅ ERFOLG! Namespaces: {len(ns)}")
-            for i, n in enumerate(ns):
-                print(f"     [{i}] {n}")
-
-            print("  🌳 Objects:")
-            for child in await client.nodes.objects.get_children():
-                name = await child.read_browse_name()
-                nid  = await child.read_node_id()
-                print(f"     {name.Name:30s} → {nid}")
-            return True
+        await client.connect()
+        print(f"  ✅ VERBUNDEN!")
+        ns = await client.get_namespace_array()
+        print(f"  Namespaces ({len(ns)}):")
+        for i, n in enumerate(ns):
+            print(f"     [{i}] {n}")
+        print("  Objects:")
+        for child in await client.nodes.objects.get_children():
+            name = await child.read_browse_name()
+            nid  = await child.read_node_id()
+            print(f"     {name.Name:30s} → {nid}")
+        await client.disconnect()
+        return True
     except Exception as e:
-        print(f"  ❌ Fehler: {e}")
+        print(f"  ❌ {e}")
+        try:
+            await client.disconnect()
+        except:
+            pass
         return False
 
 
 async def main():
     print(f"OPC UA Verbindungstest → {URL}\n{'='*60}")
 
-    variants = [
-        ("Anonymous", lambda: Client(url=URL, timeout=10)),
-        ("Username OPC/OPC", lambda: _with_user(Client(url=URL, timeout=10), "OPC", "OPC")),
-        ("Username opc/opc (lowercase)", lambda: _with_user(Client(url=URL, timeout=10), "opc", "opc")),
-        ("Username admin/admin", lambda: _with_user(Client(url=URL, timeout=10), "admin", "admin")),
-        ("Username Administrator/''", lambda: _with_user(Client(url=URL, timeout=10), "Administrator", "")),
-    ]
+    # Variante 1: Anonymous
+    c = Client(url=URL, timeout=10)
+    if await try_connect("Anonymous", c):
+        return
 
-    for label, setup in variants:
-        ok = await try_connect(label, setup)
-        if ok:
-            print(f"\n✅ FUNKTIONIERT: {label}")
-            print("→ Bitte diese Auth-Methode in opcua_config_real_server.yaml eintragen!")
-            break
-    else:
-        print("\n❌ Keine Verbindungsmethode hat funktioniert.")
-        print("Mögliche Ursachen:")
-        print("  - Falscher Port oder Endpoint-Pfad")
-        print("  - Server erwartet Zertifikat-Authentifizierung")
-        print("  - Firewall blockiert")
-        print("  - Server läuft nicht / anderer Dienst auf Port 48010")
+    # Variante 2: Username/Password — Security None
+    c = Client(url=URL, timeout=10)
+    c.set_user("OPC")
+    c.set_password("OPC")
+    if await try_connect("Username OPC/OPC (Security: None)", c):
+        return
 
-        # Prüfe ob Port offen ist
-        import socket
-        host = URL.replace("opc.tcp://", "").split(":")[0]
-        port = int(URL.split(":")[-1])
-        s = socket.socket()
-        s.settimeout(3)
-        try:
-            s.connect((host, port))
-            print(f"\n  ✅ Port {port} ist offen — Server antwortet, aber lehnt ab")
-        except:
-            print(f"\n  ❌ Port {port} nicht erreichbar — Server läuft nicht oder Firewall")
-        finally:
-            s.close()
+    # Variante 3: Username/Password — explizit kein Security Mode setzen
+    c = Client(url=URL, timeout=10)
+    c.set_user("OPC")
+    c.set_password("OPC")
+    c.set_security_string("None,None,,,")
+    if await try_connect("Username OPC/OPC + explicit None security", c):
+        return
 
+    # Variante 4: Session-Timeout erhöhen
+    c = Client(url=URL, timeout=30)
+    c.set_user("OPC")
+    c.set_password("OPC")
+    c.session_timeout = 30000
+    if await try_connect("Username OPC/OPC + 30s session timeout", c):
+        return
 
-def _with_user(client, user, password):
-    client.set_user(user)
-    client.set_password(password)
-    return client
+    # Variante 5: Ohne application_uri
+    c = Client(url=URL, timeout=10)
+    c.set_user("OPC")
+    c.set_password("OPC")
+    c.application_uri = "urn:opcua-jira-bridge:client"
+    if await try_connect("Username OPC/OPC + custom application_uri", c):
+        return
+
+    print("\n❌ Alle Varianten fehlgeschlagen.")
+    print("Bitte Ausgabe an Jarvis schicken für weitere Diagnose.")
 
 
 if __name__ == "__main__":
