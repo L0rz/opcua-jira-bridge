@@ -190,7 +190,7 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
     ctx_cfg    = cfg.get("context_nodes", [])
 
     endpoint  = os.getenv("OPCUA_ENDPOINT") or server_cfg.get("endpoint")
-    reconnect = server_cfg.get("reconnect_interval", 10)
+    reconnect = server_cfg.get("reconnect_interval", 30)
 
     log.info("Bridge gestartet — Endpoint: %s", endpoint)
 
