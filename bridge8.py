@@ -260,20 +260,23 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
             consecutive_errors = 0
             poll_count += 1
 
-            # Process values (after disconnect — Jira calls don't need OPC UA)
+            # Process values AFTER disconnect
             for i, val in enumerate(values):
                 alarm_key = alarm_keys[i]
                 prev = prev_state.get(alarm_key)
 
                 if val is True and prev is not True:
                     log.info("ALARM [%s] ACTIVE", alarm_key)
-                    # Read context on next connect would delay, use cached info
-                    context = {"alarm_key": alarm_key}
-                    # Fire and forget
+                    # Create ticket without extra connect — use basic context
+                    context = {
+                        "alarm_key": alarm_key,
+                        "room": cached_alarms[i].get("room_name", "n/a"),
+                        "root_path": cached_alarms[i].get("root_path", "n/a"),
+                    }
                     asyncio.get_event_loop().create_task(
-                        _create_ticket_with_context(
-                            endpoint, server_cfg, cached_alarms[i],
-                            ns_idx, context_nodeids, jira_cfg, alarm_cfg))
+                        create_jira_ticket(alarm_key, cached_alarms[i]["label"],
+                            alarm_cfg.get("default_priority", "High"),
+                            context, jira_cfg, alarm_cfg))
 
                 elif val is False and prev is True:
                     log.info("ALARM [%s] RESOLVED", alarm_key)
