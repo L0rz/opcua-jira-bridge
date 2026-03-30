@@ -27,51 +27,14 @@ namespace:
 
 
 # ============================================================
-# Alarm-Nodes (Mehrere Alarme)
+# Root Paths — Auto-Discovery
 # ============================================================
-# NodeIDs aus OPC UA Browser (NS2, String-basiert)
-# trigger_value: true → Alarm aktiv, false → Alarm gelöst (Auto-Resolve)
-
-alarms:
-  - key: "FEEDBACK_MOTOR1"
-    label: "Motor 1 Feedback Failure"
-    description: "Failure on Motor 1 running signal feedback"
-    nodeid: "ns=2;s=SIMULATED.DataStructure.ROOMS.ROOM1.ALARMS.FEEDBACK_MOTOR1"
-    priority: "High"
-
-  - key: "PHASE_LOSS"
-    label: "Phase Loss"
-    description: "Phase loss detected"
-    nodeid: "ns=2;s=SIMULATED.DataStructure.ROOMS.ROOM1.ALARMS.PHASE_LOSS"
-    priority: "Highest"
-
-  - key: "PUMP_OVERLOAD"
-    label: "Solution Pump Overload"
-    description: "Solution Pump Overload"
-    nodeid: "ns=2;s=SIMULATED.DataStructure.ROOMS.ROOM1.ALARMS.PUMP_OVERLOAD"
-    priority: "High"
-
-
-# ============================================================
-# Kontext-Nodes (werden ins Ticket geschrieben)
-# ============================================================
-# ROOM_ID liegt unter ROOM1/MISC/ROOM_ID (nicht direkt in ROOM1)
-context_nodes:
-  - key: "client_id"
-    label: "Client ID"
-    nodeid: "ns=2;s=SIMULATED.DataStructure.CLIENT_ID"
-
-  - key: "room_id"
-    label: "Room ID"
-    nodeid: "ns=2;s=SIMULATED.DataStructure.ROOMS.ROOM1.MISC.ROOM_ID"
-
-  - key: "server_datetime"
-    label: "Server Timestamp"
-    nodeid: "ns=2;s=SIMULATED.DataStructure.SERVER_DATETIME"
-
-  - key: "comm_plc_quality"
-    label: "PLC Communication Quality"
-    nodeid: "ns=2;s=SIMULATED.DataStructure.COMM_PLC_QUALITY"
+# Bridge browst automatisch alle ROOMS/*/ALARMS/* unter jedem Root-Path.
+# Kontext-Nodes (CLIENT_ID, ROOM_ID, etc.) werden pro Room automatisch gelesen.
+# Nur "SIMULATED" zum Testen, "SWEDLOG" für echte PLC-Daten.
+root_paths:
+  - "SIMULATED"
+  # - "SWEDLOG"    # Einkommentieren wenn echte PLCs überwacht werden sollen
 
 
 # ============================================================
@@ -83,6 +46,9 @@ alarm:
 
   # Dedup: gleicher Alarm nicht doppelt melden (Sekunden)
   dedup_cooldown: 300
+
+  # Default-Priority für auto-discovered Alarme
+  default_priority: "High"
 
   # Ticket automatisch auf "Gelöst" setzen wenn Alarm wieder false
   auto_resolve: true
