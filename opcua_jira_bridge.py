@@ -300,28 +300,21 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
 
     while True:
         try:
-            # Discovery-Client (separater Client, wird danach verworfen)
+            # Einen Client für alles (Discovery + Connect) — Elipse E3 braucht das
+            client = Client(url=endpoint, timeout=15)
+            client.session_timeout = 60000  # 60s Session-Timeout
+
             auth_mode = server_cfg.get("auth_mode", "anonymous")
-            username = os.getenv("OPCUA_USERNAME") or server_cfg.get("username", "")
-            password = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
-
-            try:
-                disc = Client(url=endpoint, timeout=15)
-                if auth_mode == "username":
-                    disc.set_user(username)
-                    disc.set_password(password)
-                endpoints = await disc.connect_and_get_server_endpoints()
-                log.info("Discovery: %d Endpoint(s) gefunden", len(endpoints))
-                await disc.disconnect()
-            except Exception as e:
-                log.warning("Endpoint-Discovery fehlgeschlagen: %s", e)
-
-            # Eigentlicher Client
-            client = Client(url=endpoint, timeout=server_cfg.get("timeout", 10))
             if auth_mode == "username":
+                username = os.getenv("OPCUA_USERNAME") or server_cfg.get("username", "")
+                password = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
                 client.set_user(username)
                 client.set_password(password)
                 log.info("Auth: %s", username)
+
+            # Discovery + Connect in einem Schritt (wie der verbose test)
+            endpoints = await client.connect_and_get_server_endpoints()
+            log.info("Discovery: %d Endpoint(s) gefunden", len(endpoints))
 
             async with client:
                 log.info("✅ Verbunden mit OPC UA Server")
