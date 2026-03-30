@@ -251,31 +251,25 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
 
                 log.info("Discovered %d alarm nodes — starting poll loop", len(all_alarms))
 
-                # Polling loop with edge detection
+                # Build node list for batch read
+                alarm_node_list = [info["node"] for info in all_alarms]
+                alarm_key_list = [info["key"] for info in all_alarms]
                 prev_state: dict[str, bool] = {}
                 poll_count = 0
-                session_start = time.time()
-                max_session_age = 25  # Reconnect before 30s server timeout
 
                 while True:
-                    # Proactive reconnect before server kills session
-                    if time.time() - session_start > max_session_age:
-                        log.info("Proactive reconnect (session age: %ds)", int(time.time() - session_start))
-                        break  # Exit to reconnect loop
+                    try:
+                        # SINGLE batch read — one OPC UA request for all 24 nodes
+                        values = await client.read_values(alarm_node_list)
 
-                    read_ok = 0
-                    for info in all_alarms:
-                        node = info["node"]
-                        alarm_key = info["key"]
-                        try:
-                            val = await node.read_value()
-                            read_ok += 1
+                        for i, val in enumerate(values):
+                            alarm_key = alarm_key_list[i]
                             prev = prev_state.get(alarm_key)
 
                             if val is True and prev is not True:
                                 log.info("ALARM [%s] ACTIVE", alarm_key)
                                 asyncio.get_event_loop().create_task(
-                                    _handle_alarm(client, info, ns_idx, root_paths, jira_cfg, alarm_cfg))
+                                    _handle_alarm(client, all_alarms[i], ns_idx, root_paths, jira_cfg, alarm_cfg))
 
                             elif val is False and prev is True:
                                 log.info("ALARM [%s] RESOLVED", alarm_key)
@@ -284,14 +278,14 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
                                         resolve_jira_ticket(alarm_key, alarm_cfg))
 
                             prev_state[alarm_key] = val
-                        except Exception as e:
-                            log.warning("Read error [%s]: %s", alarm_key, e)
-                            break
-                        await asyncio.sleep(0.02)
 
-                    poll_count += 1
-                    if poll_count % 5 == 0:
-                        log.info("Poll #%d OK (%d/%d reads)", poll_count, read_ok, len(all_alarms))
+                        poll_count += 1
+                        if poll_count % 10 == 0:
+                            log.info("Poll #%d OK (%d nodes)", poll_count, len(all_alarms))
+
+                    except Exception as e:
+                        log.warning("Batch read error: %s", e)
+                        break  # Reconnect
 
                     await asyncio.sleep(poll_interval)
 
