@@ -18,8 +18,15 @@ async def main():
         try:
             await client.connect()
             print("  Connected!")
-            ns = await client.get_namespace_array()
-            print(f"  Namespaces: {len(ns)}")
+            # Simulate bridge8: batch read alarm nodes
+            alarm_nodeids = [
+                "ns=2;s=SIMULATED.DataStructure.ROOMS.ROOM1.ALARMS.FEEDBACK_MOTOR1",
+                "ns=2;s=SIMULATED.DataStructure.ROOMS.ROOM1.ALARMS.PHASE_LOSS",
+                "ns=2;s=SIMULATED.DataStructure.ROOMS.ROOM1.ALARMS.PUMP_OVERLOAD",
+            ]
+            nodes = [client.get_node(nid) for nid in alarm_nodeids]
+            values = await client.read_values(nodes)
+            print(f"  Read OK: {values}")
             await client.disconnect()
             print("  Disconnected cleanly")
         except Exception as e:
