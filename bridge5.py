@@ -208,13 +208,14 @@ async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
                 client.set_password(password)
                 log.info("Auth: %s", username)
 
-            # Step 1: Discovery (wie test_verbose.py)
-            log.info("Step 1: Endpoint-Discovery...")
+            # Watchdog deaktivieren (Elipse E3 Server trennt die Watchdog-Verbindung)
+            client.watchdog_intervall = 0  # Disable
+
+            log.info("Endpoint-Discovery...")
             endpoints = await client.connect_and_get_server_endpoints()
             log.info("Discovery OK: %d Endpoint(s)", len(endpoints))
 
-            # Step 2: Connect (wie test_verbose.py — async with auf dem SELBEN client)
-            log.info("Step 2: Verbinde...")
+            log.info("Verbinde...")
             async with client:
                 log.info("✅ Verbunden mit OPC UA Server")
 
