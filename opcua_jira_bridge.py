@@ -1,12 +1,12 @@
 """
 OPC UA → Jira Bridge
 
-Flexibel konfigurierbar über opcua_config.yaml.
 Unterstützt:
-  - Anonymous / Username / Certificate Auth
-  - NodeId-basiertes oder Browse-Path-basiertes Node-Discovery
-  - Namespace via URI oder direktem Index
-  - Beliebige zusätzliche Datennodes
+  - Mehrere Alarm-Nodes parallel (Subscribe auf alle gleichzeitig)
+  - Auto-Resolve: Ticket wird auf "Gelöst" gesetzt wenn Alarm wieder FALSE
+  - Kontext-Nodes (CLIENT_ID, ROOM_ID etc.) werden ins Ticket geschrieben
+  - Username-Auth (Security Policy: None)
+  - Duplikat-Schutz per Cooldown
 """
 
 import asyncio
@@ -18,8 +18,7 @@ from pathlib import Path
 
 import httpx
 import yaml
-from asyncua import Client, ua
-from asyncua.crypto.security_policies import SecurityPolicyBasic256Sha256
+from asyncua import Client
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,165 +26,149 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [BRIDGE] %(message)s")
 log = logging.getLogger("bridge")
 
-# ── Jira Credentials aus .env ──────────────────────────────────────────────
-JIRA_URL = os.getenv("JIRA_URL")
-JIRA_USER = os.getenv("JIRA_USER")
-JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
-JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY", "RKS")
+# ── Jira Credentials ──────────────────────────────────────────────────────────
+JIRA_URL        = os.getenv("JIRA_URL")
+JIRA_USER       = os.getenv("JIRA_USER")
+JIRA_API_TOKEN  = os.getenv("JIRA_API_TOKEN")
+JIRA_PROJECT    = os.getenv("JIRA_PROJECT_KEY", "RKS")
 JIRA_ACCOUNT_ID = os.getenv("JIRA_ACCOUNT_ID")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
 # State
-_recent_alarms: dict[str, float] = {}
-_created_tickets: list[dict] = []
+# ─────────────────────────────────────────────────────────────────────────────
+
+# { alarm_key: { "ticket_key": "RKS-42", "created_at": ts } }
+_open_tickets:   dict[str, dict] = {}
+_created_tickets: list[dict]     = []
+_recent_alarms:  dict[str, float] = {}  # Dedup-Timestamps
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config Loading
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_config(config_path: str = "opcua_config.yaml") -> dict:
-    """Lädt die YAML-Konfiguration."""
+def load_config(config_path: str = "opcua_config_real_server.yaml") -> dict:
     path = Path(config_path)
     if not path.exists():
-        raise FileNotFoundError(f"Konfigurationsdatei nicht gefunden: {config_path}")
+        raise FileNotFoundError(f"Config nicht gefunden: {config_path}")
     with open(path) as f:
-        cfg = yaml.safe_load(f)
-    log.info("Konfiguration geladen: %s", config_path)
-    return cfg
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Namespace Discovery
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def resolve_namespace(client: Client, ns_cfg: dict) -> int:
-    """Ermittelt den Namespace-Index."""
-    mode = ns_cfg.get("discovery_mode", "uri")
-
-    if mode == "index":
-        idx = ns_cfg.get("index", 2)
-        log.info("Namespace-Index (direkt): %d", idx)
-        return idx
-
-    if mode in ("uri", "auto"):
-        uri = ns_cfg.get("uri", "")
-        if uri:
-            try:
-                idx = await client.get_namespace_index(uri)
-                log.info("Namespace-URI '%s' → Index %d", uri, idx)
-                return idx
-            except Exception as e:
-                if mode == "auto":
-                    fallback = ns_cfg.get("index", 2)
-                    log.warning("URI-Discovery fehlgeschlagen (%s) → Fallback auf Index %d", e, fallback)
-                    return fallback
-                raise
-
-    raise ValueError(f"Unbekannter discovery_mode: {mode}")
+        return yaml.safe_load(f)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Node Resolution
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def resolve_node(client: Client, node_cfg: dict, ns_idx: int):
-    """Löst einen Node anhand der Konfiguration auf."""
-    method = node_cfg.get("method", "browse_path")
+async def resolve_node_by_path(client: Client, browse_path: list[str], ns_idx: int):
+    """Löst einen Node über Browse-Path auf (relativ zu Objects)."""
+    node = client.nodes.objects
+    for segment in browse_path:
+        node = await node.get_child([f"{ns_idx}:{segment}"])
+    return node
 
-    if method == "nodeid":
-        nodeid_str = node_cfg["nodeid"]
-        node = client.get_node(nodeid_str)
-        log.debug("Node via NodeId: %s", nodeid_str)
-        return node
 
-    if method == "browse_path":
-        path = node_cfg.get("browse_path", [])
-        root = client.nodes.objects
-        node = root
-        for segment in path:
-            node = await node.get_child([f"{ns_idx}:{segment}"])
-        log.debug("Node via Browse-Path %s → %s", path, await node.read_node_id())
-        return node
+def resolve_node_by_id(client: Client, nodeid: str):
+    """Löst einen Node direkt per NodeId auf (z.B. 'ns=2;s=SIMULATED.DataStructure.CLIENT_ID')."""
+    return client.get_node(nodeid)
 
-    raise ValueError(f"Unbekannte Node-Methode: {method}")
+
+async def discover_namespace(client: Client, ns_cfg: dict) -> int:
+    mode = ns_cfg.get("discovery_mode", "auto")
+    uri  = ns_cfg.get("uri", "")
+    fallback = ns_cfg.get("index", 2)
+
+    if mode == "index":
+        return fallback
+
+    if uri and mode in ("uri", "auto"):
+        try:
+            idx = await client.get_namespace_index(uri)
+            log.info("Namespace URI '%s' → Index %d", uri, idx)
+            return idx
+        except Exception as e:
+            if mode == "auto":
+                log.warning("URI-Discovery fehlgeschlagen (%s) → Fallback Index %d", e, fallback)
+                return fallback
+            raise
+
+    return fallback
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Jira
+# Jira Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _is_duplicate(alarm_key: str, cooldown: int) -> bool:
     now = time.time()
-    if alarm_key in _recent_alarms:
-        if now - _recent_alarms[alarm_key] < cooldown:
-            return True
+    last = _recent_alarms.get(alarm_key, 0)
+    if now - last < cooldown:
+        return True
     _recent_alarms[alarm_key] = now
     return False
 
 
-async def create_jira_ticket(
-    alarm_data: dict,
-    cfg: dict,
-) -> dict | None:
-    """Erstellt ein Jira-Ticket basierend auf den Alarmdaten und der Konfiguration."""
-    jira_cfg = cfg.get("jira", {})
-    alarm_cfg = cfg.get("alarm", {})
+async def _jira_post(path: str, payload: dict) -> dict | None:
+    try:
+        async with httpx.AsyncClient() as http:
+            resp = await http.post(
+                f"{JIRA_URL}{path}",
+                json=payload,
+                auth=(JIRA_USER, JIRA_API_TOKEN),
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            return resp.json() if resp.content else {}
+    except httpx.HTTPStatusError as e:
+        log.error("Jira API %d: %s", e.response.status_code, e.response.text[:300])
+    except Exception as e:
+        log.error("Jira Verbindung: %s", e)
+    return None
 
-    alarm_message = alarm_data.get("alarm_message", "Unbekannter Alarm")
-    error_code = alarm_data.get("error_code", 0)
 
-    # Dedup
-    core_msg = alarm_message
-    if "] " in core_msg:
-        core_msg = core_msg.split("] ", 1)[1]
+async def create_jira_ticket(alarm_cfg: dict, context: dict, jira_cfg: dict, alarm_cfg_global: dict) -> dict | None:
+    alarm_key   = alarm_cfg["key"]
+    alarm_label = alarm_cfg["label"]
+    alarm_desc  = alarm_cfg.get("description", alarm_label)
+    priority    = alarm_cfg.get("priority", "Medium")
 
-    cooldown = alarm_cfg.get("dedup_cooldown", 300)
-    if _is_duplicate(core_msg, cooldown):
-        log.info("Doppel-Ticket verhindert: %s", core_msg)
+    cooldown = alarm_cfg_global.get("dedup_cooldown", 300)
+    if _is_duplicate(alarm_key, cooldown):
+        log.info("Dedup: Kein neues Ticket für %s", alarm_key)
         return None
 
-    # Priority
-    priority_map = alarm_cfg.get("priority_map", {})
-    priority = priority_map.get(error_code, priority_map.get("default", "Medium"))
-
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    client_id = context.get("client_id", "n/a")
+    room_id   = context.get("room_id", "n/a")
 
-    # Summary
-    summary_tpl = jira_cfg.get("summary_template", "[OPC UA Alarm] {alarm_message}")
+    summary_tpl = jira_cfg.get("summary_template", "[OPC UA] {client_id} / {room_id} — {alarm_label}")
     summary = summary_tpl.format(
-        alarm_message=core_msg,
-        error_code=error_code,
-        node_name=alarm_data.get("_node_name", ""),
+        alarm_key=alarm_key,
+        alarm_label=alarm_label,
+        client_id=client_id,
+        room_id=room_id,
     )[:255]
 
-    # Description aus allen Datennodes aufbauen
-    desc_rows = f"||Parameter||Wert||\n|Zeitstempel|{ts}|\n"
-    nodes_cfg = cfg.get("nodes", {})
-    for node_name, node_cfg in nodes_cfg.items():
-        if node_name == "alarm_active":
-            continue
-        if not node_cfg.get("enabled", True):
-            continue
-        label = node_cfg.get("label", node_name)
-        unit = node_cfg.get("unit", "")
-        value = alarm_data.get(node_name, "n/a")
-        if isinstance(value, float):
-            value = f"{value:.2f}"
-        desc_rows += f"|{label}|{value} {unit}|\n"
+    # Beschreibung (Jira Wiki Markup Table)
+    rows = f"||Parameter||Wert||\n|Zeitstempel|{ts}|\n|Alarm-Key|{alarm_key}|\n"
+    for k, v in context.items():
+        rows += f"|{k}|{v}|\n"
 
     description = (
         f"*Automatisch erstellt durch OPC UA → Jira Bridge*\n\n"
-        f"{desc_rows}\n"
+        f"*Alarm:* {alarm_desc}\n\n"
+        f"{rows}\n"
         f"Bitte umgehend prüfen und Maßnahmen einleiten."
     )
 
-    payload = {
+    payload: dict = {
         "fields": {
-            "project": {"key": JIRA_PROJECT_KEY},
-            "summary": summary,
+            "project":   {"key": JIRA_PROJECT},
+            "summary":   summary,
             "description": description,
             "issuetype": {"name": jira_cfg.get("issue_type", "Incident")},
-            "priority": {"name": priority},
+            "priority":  {"name": priority},
         }
     }
 
@@ -196,155 +179,181 @@ async def create_jira_ticket(
     if jira_cfg.get("auto_assign", True) and JIRA_ACCOUNT_ID:
         payload["fields"]["assignee"] = {"accountId": JIRA_ACCOUNT_ID}
 
-    custom = jira_cfg.get("custom_fields", {})
-    for field_id, value in custom.items():
-        payload["fields"][field_id] = value
-
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{JIRA_URL}/rest/api/2/issue",
-                json=payload,
-                auth=(JIRA_USER, JIRA_API_TOKEN),
-                headers={"Content-Type": "application/json"},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            ticket = {
-                "key": data["key"],
-                "id": data["id"],
-                "summary": summary,
-                "priority": priority,
-                "error_code": error_code,
-                "created_at": ts,
-                "url": f"{JIRA_URL}/browse/{data['key']}",
-            }
-            _created_tickets.append(ticket)
-            log.info("✅ Jira-Ticket erstellt: %s → %s", data["key"], ticket["url"])
-            return ticket
-    except httpx.HTTPStatusError as e:
-        log.error("Jira API Fehler %d: %s", e.response.status_code, e.response.text[:300])
-        return None
-    except Exception as e:
-        log.error("Jira-Verbindung fehlgeschlagen: %s", e)
+    data = await _jira_post("/rest/api/2/issue", payload)
+    if not data:
         return None
 
+    ticket = {
+        "key":        data["key"],
+        "id":         data["id"],
+        "alarm_key":  alarm_key,
+        "summary":    summary,
+        "priority":   priority,
+        "created_at": ts,
+        "url":        f"{JIRA_URL}/browse/{data['key']}",
+    }
+    _open_tickets[alarm_key] = ticket
+    _created_tickets.append(ticket)
+    log.info("✅ Ticket erstellt: %s → %s", data["key"], ticket["url"])
+    return ticket
 
-def get_created_tickets() -> list[dict]:
-    return list(_created_tickets)
+
+async def resolve_jira_ticket(alarm_key: str, alarm_cfg_global: dict) -> bool:
+    """Setzt ein offenes Ticket auf 'Gelöst' wenn der Alarm wieder FALSE ist."""
+    ticket = _open_tickets.get(alarm_key)
+    if not ticket:
+        return False
+
+    transition_id = str(alarm_cfg_global.get("resolve_transition_id", "31"))
+    comment       = alarm_cfg_global.get("resolve_comment", "Alarm automatisch gelöst.")
+
+    issue_key = ticket["key"]
+
+    # Transition ausführen
+    t_data = await _jira_post(
+        f"/rest/api/2/issue/{issue_key}/transitions",
+        {"transition": {"id": transition_id}},
+    )
+
+    # Kommentar hinzufügen
+    await _jira_post(
+        f"/rest/api/2/issue/{issue_key}/comment",
+        {"body": comment},
+    )
+
+    if t_data is not None:
+        log.info("✅ Ticket %s auf 'Gelöst' gesetzt", issue_key)
+        del _open_tickets[alarm_key]
+        return True
+    else:
+        log.warning("Konnte Ticket %s nicht auflösen", issue_key)
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OPC UA Subscription Handler
+# Subscription Handler
 # ─────────────────────────────────────────────────────────────────────────────
 
-class AlarmHandler:
-    def __init__(self, client: Client, data_nodes: dict, cfg: dict):
-        self.client = client
-        self.data_nodes = data_nodes  # {node_name: node_object}
-        self.cfg = cfg
-        self.trigger_value = cfg.get("alarm", {}).get("trigger_value", True)
+class MultiAlarmHandler:
+    """Subscriber für mehrere Alarm-Nodes. Jeder Node wird mit seinem alarm_cfg registriert."""
+
+    def __init__(self, client: Client, node_to_alarm: dict, context_nodes: dict, cfg: dict):
+        """
+        node_to_alarm: { node_id_str: alarm_cfg_dict }
+        context_nodes: { key: node_object }
+        """
+        self.client        = client
+        self.node_to_alarm = node_to_alarm
+        self.context_nodes = context_nodes
+        self.cfg           = cfg
+        self.jira_cfg      = cfg.get("jira", {})
+        self.alarm_cfg     = cfg.get("alarm", {})
 
     def datachange_notification(self, node, val, data):
-        if val == self.trigger_value or (self.trigger_value is True and val is True):
-            log.info("🚨 Alarm erkannt (Wert: %s) — Erstelle Jira-Ticket...", val)
-            asyncio.get_event_loop().create_task(self._handle_alarm())
+        loop = asyncio.get_event_loop()
+        node_id = str(node.nodeid)
 
-    async def _handle_alarm(self):
-        alarm_data = {}
-        for node_name, node_obj in self.data_nodes.items():
+        alarm_def = self.node_to_alarm.get(node_id)
+        if alarm_def is None:
+            log.warning("Unbekannter Node: %s", node_id)
+            return
+
+        trigger = self.alarm_cfg.get("trigger_value", True)
+        alarm_key = alarm_def["key"]
+
+        if val == trigger or (trigger is True and val is True):
+            log.info("🚨 ALARM [%s] aktiv (Wert: %s)", alarm_key, val)
+            loop.create_task(self._on_alarm(alarm_def))
+        else:
+            log.info("✅ ALARM [%s] gelöst (Wert: %s)", alarm_key, val)
+            if self.alarm_cfg.get("auto_resolve", True):
+                loop.create_task(resolve_jira_ticket(alarm_key, self.alarm_cfg))
+
+    async def _on_alarm(self, alarm_def: dict):
+        # Kontext-Nodes auslesen
+        context = {}
+        for key, node_obj in self.context_nodes.items():
             try:
-                alarm_data[node_name] = await node_obj.read_value()
+                context[key] = await node_obj.read_value()
             except Exception as e:
-                log.warning("Konnte Node '%s' nicht lesen: %s", node_name, e)
-                alarm_data[node_name] = "n/a"
+                log.warning("Kontext-Node '%s' nicht lesbar: %s", key, e)
+                context[key] = "n/a"
 
-        await create_jira_ticket(alarm_data, self.cfg)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Client Setup (Auth)
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def setup_client(server_cfg: dict) -> Client:
-    """Erstellt und konfiguriert den OPC UA Client."""
-    endpoint = os.getenv("OPCUA_ENDPOINT") or server_cfg.get("endpoint", "opc.tcp://localhost:4840/")
-    client = Client(url=endpoint, timeout=server_cfg.get("timeout", 10))
-
-    auth_mode = server_cfg.get("auth_mode", "anonymous")
-    security_policy = server_cfg.get("security_policy", "None")
-    security_mode = server_cfg.get("security_mode", "None")
-
-    if auth_mode == "username":
-        username = os.getenv("OPCUA_USERNAME") or server_cfg.get("username", "")
-        password = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
-        client.set_user(username)
-        client.set_password(password)
-        log.info("Auth: Username (%s)", username)
-
-    elif auth_mode == "certificate":
-        cert_path = server_cfg.get("certificate_path", "")
-        key_path = server_cfg.get("private_key_path", "")
-        if security_policy != "None" and security_mode != "None":
-            await client.set_security_string(
-                f"Basic256Sha256,{security_mode},{cert_path},{key_path}"
-            )
-            log.info("Auth: Certificate + Security %s/%s", security_policy, security_mode)
-    else:
-        log.info("Auth: Anonymous")
-
-    return client
+        await create_jira_ticket(alarm_def, context, self.jira_cfg, self.alarm_cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Bridge Loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run_bridge(config_path: str = "opcua_config.yaml"):
-    cfg = load_config(config_path)
+async def run_bridge(config_path: str = "opcua_config_real_server.yaml"):
+    cfg        = load_config(config_path)
     server_cfg = cfg.get("server", {})
-    ns_cfg = cfg.get("namespace", {})
-    nodes_cfg = cfg.get("nodes", {})
+    ns_cfg     = cfg.get("namespace", {})
+    alarms_cfg = cfg.get("alarms", [])
+    ctx_cfg    = cfg.get("context_nodes", [])
 
-    endpoint = os.getenv("OPCUA_ENDPOINT") or server_cfg.get("endpoint")
+    endpoint  = os.getenv("OPCUA_ENDPOINT") or server_cfg.get("endpoint")
     reconnect = server_cfg.get("reconnect_interval", 5)
 
-    log.info("Bridge gestartet — Verbinde mit: %s", endpoint)
+    log.info("Bridge gestartet — Endpoint: %s", endpoint)
 
     while True:
         try:
-            client = await setup_client(server_cfg)
+            client = Client(url=endpoint, timeout=server_cfg.get("timeout", 10))
+
+            # Auth
+            auth_mode = server_cfg.get("auth_mode", "anonymous")
+            if auth_mode == "username":
+                username = os.getenv("OPCUA_USERNAME") or server_cfg.get("username", "")
+                password = os.getenv("OPCUA_PASSWORD") or server_cfg.get("password", "")
+                client.set_user(username)
+                client.set_password(password)
+                log.info("Auth: %s", username)
 
             async with client:
                 log.info("✅ Verbunden mit OPC UA Server")
+                ns_idx = await discover_namespace(client, ns_cfg)
+                log.info("Namespace-Index: %d", ns_idx)
 
-                # Namespace auflösen
-                ns_idx = await resolve_namespace(client, ns_cfg)
+                # Alarm-Nodes auflösen (NodeId bevorzugt, Browse-Path als Fallback)
+                alarm_nodes = {}    # { node_id_str: alarm_cfg }
+                alarm_node_objs = []
 
-                # Alarm-Trigger-Node
-                alarm_active_cfg = nodes_cfg.get("alarm_active", {})
-                alarm_node = await resolve_node(client, alarm_active_cfg, ns_idx)
-                log.info("Alarm-Node gefunden: %s", await alarm_node.read_node_id())
-
-                # Datennodes für Ticket-Inhalt
-                data_nodes = {}
-                for node_name, node_cfg in nodes_cfg.items():
-                    if node_name == "alarm_active":
-                        continue
-                    if not node_cfg.get("enabled", True):
-                        continue
+                for alarm_def in alarms_cfg:
                     try:
-                        data_nodes[node_name] = await resolve_node(client, node_cfg, ns_idx)
-                        log.info("Daten-Node '%s' gefunden", node_name)
+                        if "nodeid" in alarm_def:
+                            node = resolve_node_by_id(client, alarm_def["nodeid"])
+                        else:
+                            node = await resolve_node_by_path(client, alarm_def["browse_path"], ns_idx)
+                        nid  = str((await node.read_node_id()))
+                        alarm_nodes[nid] = alarm_def
+                        alarm_node_objs.append(node)
+                        log.info("Alarm-Node [%s] → %s", alarm_def["key"], nid)
                     except Exception as e:
-                        log.warning("Node '%s' nicht gefunden: %s — wird übersprungen", node_name, e)
+                        log.error("Alarm-Node [%s] nicht gefunden: %s", alarm_def.get("key"), e)
 
-                # Subscription
-                handler = AlarmHandler(client, data_nodes, cfg)
-                sub = await client.create_subscription(500, handler)
-                await sub.subscribe_data_change(alarm_node)
-                log.info("Subscribed auf Alarm-Node — warte auf Alarme...")
+                if not alarm_node_objs:
+                    raise RuntimeError("Keine Alarm-Nodes gefunden!")
+
+                # Kontext-Nodes auflösen (NodeId bevorzugt, Browse-Path als Fallback)
+                context_nodes = {}
+                for ctx in ctx_cfg:
+                    try:
+                        if "nodeid" in ctx:
+                            node = resolve_node_by_id(client, ctx["nodeid"])
+                        else:
+                            node = await resolve_node_by_path(client, ctx["browse_path"], ns_idx)
+                        context_nodes[ctx["key"]] = node
+                        log.info("Kontext-Node [%s] gefunden", ctx["key"])
+                    except Exception as e:
+                        log.warning("Kontext-Node [%s] nicht gefunden: %s", ctx.get("key"), e)
+
+                # Subscription auf alle Alarm-Nodes
+                handler = MultiAlarmHandler(client, alarm_nodes, context_nodes, cfg)
+                sub     = await client.create_subscription(500, handler)
+                await sub.subscribe_data_change(alarm_node_objs)
+                log.info("Subscribed auf %d Alarm-Node(s) — warte auf Alarme...", len(alarm_node_objs))
 
                 while True:
                     await asyncio.sleep(1)
@@ -354,7 +363,14 @@ async def run_bridge(config_path: str = "opcua_config.yaml"):
             await asyncio.sleep(reconnect)
 
 
+def get_created_tickets() -> list[dict]:
+    return list(_created_tickets)
+
+def get_open_tickets() -> dict:
+    return dict(_open_tickets)
+
+
 if __name__ == "__main__":
     import sys
-    config_file = sys.argv[1] if len(sys.argv) > 1 else "opcua_config.yaml"
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "opcua_config_real_server.yaml"
     asyncio.run(run_bridge(config_file))
