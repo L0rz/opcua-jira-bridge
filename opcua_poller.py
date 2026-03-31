@@ -207,7 +207,7 @@ class DebounceTracker:
 
 def create_client(endpoint: str, username: str, password: str) -> Client:
     client = Client(endpoint, timeout=10)
-    client.session_timeout = 600000  # 10 min
+    client.session_timeout = 3600000  # request 1h (server may revise down)
     client.set_user(username)
     client.set_password(password)
     return client
@@ -332,10 +332,19 @@ def main() -> None:
                 if current is not None:
                     debounce.seed(node["alarm_key"], current)
 
-            # Inner poll loop — runs until connection drops
+            # Inner poll loop — runs until connection drops or session needs refresh
             poll_count = 0
+            session_start = time.monotonic()
+            session_max_age = 540  # reconnect after 9 min (server timeout ~10 min)
+
             while True:
                 poll_count += 1
+
+                # Proactive reconnect before server kills session
+                session_age = time.monotonic() - session_start
+                if session_age > session_max_age:
+                    log.info("Session age %.0fs > %ds — proactive reconnect", session_age, session_max_age)
+                    break  # exit to reconnect loop
 
                 values = read_all_values(client, alarm_nodeids)
                 if values is None:
@@ -358,7 +367,8 @@ def main() -> None:
 
                 # Heartbeat every 10 polls
                 if poll_count % 10 == 0:
-                    log.info("♥ Poll #%d OK — %d pending debounce", poll_count, debounce.pending_count)
+                    log.info("♥ Poll #%d OK (session age: %.0fs) — %d pending debounce",
+                             poll_count, session_age, debounce.pending_count)
 
                 time.sleep(poll_interval)
 
@@ -389,3 +399,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
