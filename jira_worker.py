@@ -101,14 +101,14 @@ def fetch_resolved_pending(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def get_open_ticket_for_alarm(conn: sqlite3.Connection, alarm_key: str) -> str | None:
-    """Return the ticket_key of the latest open (ticket_created) event for this alarm."""
+    """Return the open_ticket_key from alarm_state (persistent across event status changes)."""
     row = conn.execute(
-        "SELECT ticket_key FROM alarm_events "
-        "WHERE alarm_key=? AND status='ticket_created' "
-        "ORDER BY id DESC LIMIT 1",
+        "SELECT open_ticket_key FROM alarm_state WHERE alarm_key=?",
         (alarm_key,),
     ).fetchone()
-    return row["ticket_key"] if row else None
+    if row and row["open_ticket_key"]:
+        return row["open_ticket_key"]
+    return None
 
 
 def mark_event_ticket_created(
@@ -133,22 +133,21 @@ def mark_event_resolved(conn: sqlite3.Connection, event_id: int) -> None:
         "UPDATE alarm_events SET status='resolved', processed_at=? WHERE id=?",
         (now, event_id),
     )
-    # Clear open_ticket_key in alarm_state
-    conn.execute(
-        "UPDATE alarm_state SET open_ticket_key=NULL WHERE alarm_key=("
-        "SELECT alarm_key FROM alarm_events WHERE id=?)",
-        (event_id,),
-    )
+    # DO NOT clear open_ticket_key — ticket stays open until manually closed in Jira
     conn.commit()
 
 
 def mark_event_superseded(conn: sqlite3.Connection, alarm_key: str, new_ticket_key: str) -> None:
-    """Mark old ticket_created events as superseded when a new ticket replaces them."""
+    """Mark old events as superseded and clear open_ticket_key so a new ticket can be created."""
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE alarm_events SET status='superseded', processed_at=? "
-        "WHERE alarm_key=? AND status='ticket_created'",
+        "WHERE alarm_key=? AND status IN ('ticket_created', 'commented', 'resolved')",
         (now, alarm_key),
+    )
+    conn.execute(
+        "UPDATE alarm_state SET open_ticket_key=NULL WHERE alarm_key=?",
+        (alarm_key,),
     )
     conn.commit()
 
@@ -568,3 +567,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
