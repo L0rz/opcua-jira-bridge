@@ -13,6 +13,7 @@ import logging
 import platform
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +44,9 @@ DB_FILE = BASE_DIR / "alarms.db"
 # Reconnect backoff: starts at 5s, doubles up to 60s
 RECONNECT_MIN = 5
 RECONNECT_MAX = 60
+
+# Debounce: alarm must be stable for this many seconds before writing to DB
+DEBOUNCE_SECONDS = 30
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -170,18 +174,26 @@ def write_state_change(
 # ── Subscription handler ──────────────────────────────────────────────────────
 
 class AlarmSubscriptionHandler:
-    """Handles DataChange notifications from OPC UA subscriptions."""
+    """Handles DataChange notifications with debounce.
 
-    def __init__(self, node_map: dict[str, dict], conn: sqlite3.Connection) -> None:
-        # node_map: nodeid_string → node_info dict
+    An alarm must stay in a new state for DEBOUNCE_SECONDS before it's
+    written to the DB. This prevents flapping alarms from flooding the DB
+    with events every ~5 seconds.
+    """
+
+    def __init__(self, node_map: dict[str, dict], conn: sqlite3.Connection, debounce_seconds: float = DEBOUNCE_SECONDS) -> None:
         self.node_map = node_map
         self.conn = conn
+        self.debounce_seconds = debounce_seconds
+        # alarm_key → {"value": bool, "since": timestamp}
+        # Tracks the last raw value received and when it first appeared
+        self._pending: dict[str, dict] = {}
+        self._committed_state: dict[str, bool] = {}  # last value written to DB
 
     def datachange_notification(self, node, val, data: DataChangeNotif) -> None:
         nodeid = node.nodeid.to_string()
         node_info = self.node_map.get(nodeid)
         if node_info is None:
-            log.warning("Received notification for unknown node: %s", nodeid)
             return
 
         alarm_key = node_info["alarm_key"]
@@ -189,16 +201,47 @@ class AlarmSubscriptionHandler:
         try:
             bool_value = bool(val)
         except Exception:
-            log.warning("Cannot convert value for %s: %r", alarm_key, val)
             return
 
-        prev = get_current_state(self.conn, alarm_key)
+        now = time.monotonic()
+        pending = self._pending.get(alarm_key)
 
-        # Only write on actual state change
-        if prev != bool_value:
-            write_state_change(self.conn, alarm_key, bool_value)
-        else:
-            log.debug("No change for %s (still %s)", alarm_key, bool_value)
+        if pending is None or pending["value"] != bool_value:
+            # New state or first notification — start debounce timer
+            self._pending[alarm_key] = {"value": bool_value, "since": now}
+            if pending is not None:
+                log.debug("Debounce reset: %s → %s (was %s for %.1fs)",
+                          alarm_key, bool_value, pending["value"], now - pending["since"])
+        # If same value, just let the timer continue
+
+    def flush_debounced(self) -> int:
+        """Check all pending values and write those that have been stable long enough.
+        Returns number of state changes written.
+        """
+        now = time.monotonic()
+        changes = 0
+
+        for alarm_key, pending in list(self._pending.items()):
+            elapsed = now - pending["since"]
+            if elapsed < self.debounce_seconds:
+                continue
+
+            bool_value = pending["value"]
+            committed = self._committed_state.get(alarm_key)
+
+            if committed != bool_value:
+                write_state_change(self.conn, alarm_key, bool_value)
+                self._committed_state[alarm_key] = bool_value
+                changes += 1
+
+            # Remove from pending — it's been flushed
+            del self._pending[alarm_key]
+
+        return changes
+
+    def get_pending_count(self) -> int:
+        """Return number of alarms currently in debounce."""
+        return len(self._pending)
 
     def event_notification(self, event) -> None:
         log.debug("Event notification: %s", event)
@@ -297,12 +340,11 @@ async def run_subscription(
     monitored_items = await subscription.subscribe_data_change(nodes)
     log.info("Subscribed to %d alarm nodes — waiting for notifications", len(alarm_nodes))
 
-    # Also do an initial read to seed current state
+    # Initial read to seed committed state (bypass debounce for initial sync)
     log.info("Initial state read...")
     values = await client.read_values(nodes)
     for i, node_obj in enumerate(alarm_nodes):
         alarm_key = node_obj["alarm_key"]
-        nodeid = node_obj["nodeid"]
         try:
             bool_value = bool(values[i])
         except Exception:
@@ -310,23 +352,33 @@ async def run_subscription(
         prev = get_current_state(conn, alarm_key)
         if prev != bool_value:
             write_state_change(conn, alarm_key, bool_value)
-    log.info("Initial state read complete")
+        # Seed the handler's committed state so debounce knows current baseline
+        handler._committed_state[alarm_key] = bool_value if prev is None else (bool_value if prev != bool_value else prev)
+    log.info("Initial state read complete — debounce=%ds", DEBOUNCE_SECONDS)
 
-    # Keep running until the connection drops or we get cancelled (Ctrl+C)
+    # Main loop: flush debounced events + keep-alive
     heartbeat_count = 0
     try:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)  # Check debounce every 5s
             heartbeat_count += 1
 
-            # Active keep-alive: read server status node to force traffic
-            try:
-                server_state = await client.nodes.server_state.read_value()
-                if heartbeat_count % 10 == 0:  # Log every ~5 min
-                    log.info("♥ Connection alive (server state: %s, uptime: %d checks)", server_state, heartbeat_count)
-            except Exception as exc:
-                log.warning("Keep-alive read failed: %s", exc)
-                raise
+            # Flush any debounced state changes
+            flushed = handler.flush_debounced()
+            if flushed:
+                log.info("Debounce flush: %d stable state change(s) written to DB", flushed)
+
+            # Keep-alive every 30s (every 6th iteration)
+            if heartbeat_count % 6 == 0:
+                try:
+                    server_state = await client.nodes.server_state.read_value()
+                    pending = handler.get_pending_count()
+                    if heartbeat_count % 60 == 0:  # Log every ~5 min
+                        log.info("♥ Connection alive (server state: %s, pending debounce: %d, uptime: %d checks)",
+                                 server_state, pending, heartbeat_count)
+                except Exception as exc:
+                    log.warning("Keep-alive read failed: %s", exc)
+                    raise
     except asyncio.CancelledError:
         log.info("Shutdown requested — disconnecting cleanly...")
         raise
@@ -464,6 +516,7 @@ if __name__ == "__main__":
     finally:
         loop.close()
         log.info("Poller stopped")
+
 
 
 
