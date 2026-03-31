@@ -1,8 +1,11 @@
 """
-opcua_poller.py — OPC UA Alarm Poller (NO Jira/httpx)
+opcua_poller.py — OPC UA Alarm Poller via Subscriptions (NO Jira/httpx)
 
-Connects to OPC UA server, discovers alarm nodes, polls them on an interval,
-and writes state changes to SQLite (shared with jira_worker.py).
+Connects to OPC UA server, discovers alarm nodes, subscribes to DataChange
+notifications, and writes state changes to SQLite (shared with jira_worker.py).
+
+Subscriptions keep the session alive — no more 30s timeout / rate-limiting.
+Auto-reconnects on connection loss with exponential backoff.
 """
 
 import asyncio
@@ -15,6 +18,7 @@ from pathlib import Path
 
 import yaml
 from asyncua import Client, ua
+from asyncua.common.subscription import DataChangeNotif
 
 # ── Windows event loop fix ────────────────────────────────────────────────────
 if platform.system() == "Windows":
@@ -32,6 +36,10 @@ log = logging.getLogger("poller")
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "opcua_config_real_server.yaml"
 DB_FILE = BASE_DIR / "alarms.db"
+
+# Reconnect backoff: starts at 5s, doubles up to 60s
+RECONNECT_MIN = 5
+RECONNECT_MAX = 60
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -104,36 +112,31 @@ def get_current_state(conn: sqlite3.Connection, alarm_key: str) -> bool | None:
     if row is None:
         return None
     val = row["current_value"]
-    if val is None:
-        return None
-    return bool(val)
+    return bool(val) if val is not None else None
 
 
 def write_state_change(
     conn: sqlite3.Connection,
     alarm_key: str,
     new_value: bool,
-    open_ticket_key: str | None = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
 
     # Update alarm_state
     conn.execute(
         """INSERT INTO alarm_state (alarm_key, current_value, last_changed, open_ticket_key)
-           VALUES (?, ?, ?, ?)
+           VALUES (?, ?, ?, NULL)
            ON CONFLICT(alarm_key) DO UPDATE SET
                current_value=excluded.current_value,
                last_changed=excluded.last_changed""",
-        (alarm_key, new_value, now, open_ticket_key),
+        (alarm_key, new_value, now),
     )
 
-    # Determine event status
     if new_value:
         # Alarm triggered → new event for jira_worker
-        status = "new"
         conn.execute(
             "INSERT INTO alarm_events (alarm_key, value, status, created_at) VALUES (?,?,?,?)",
-            (alarm_key, True, status, now),
+            (alarm_key, True, "new", now),
         )
         log.info("ALARM ON  : %s → new event inserted", alarm_key)
     else:
@@ -152,7 +155,6 @@ def write_state_change(
             )
             log.info("ALARM OFF : %s → resolved_pending (ticket %s)", alarm_key, open_row["ticket_key"])
         else:
-            # No open ticket — insert resolved event directly (ignored by jira_worker)
             conn.execute(
                 "INSERT INTO alarm_events (alarm_key, value, status, created_at) VALUES (?,?,?,?)",
                 (alarm_key, False, "ignored", now),
@@ -160,6 +162,46 @@ def write_state_change(
             log.info("ALARM OFF : %s → no open ticket, ignored", alarm_key)
 
     conn.commit()
+
+
+# ── Subscription handler ──────────────────────────────────────────────────────
+
+class AlarmSubscriptionHandler:
+    """Handles DataChange notifications from OPC UA subscriptions."""
+
+    def __init__(self, node_map: dict[str, dict], conn: sqlite3.Connection) -> None:
+        # node_map: nodeid_string → node_info dict
+        self.node_map = node_map
+        self.conn = conn
+
+    def datachange_notification(self, node, val, data: DataChangeNotif) -> None:
+        nodeid = node.nodeid.to_string()
+        node_info = self.node_map.get(nodeid)
+        if node_info is None:
+            log.warning("Received notification for unknown node: %s", nodeid)
+            return
+
+        alarm_key = node_info["alarm_key"]
+
+        try:
+            bool_value = bool(val)
+        except Exception:
+            log.warning("Cannot convert value for %s: %r", alarm_key, val)
+            return
+
+        prev = get_current_state(self.conn, alarm_key)
+
+        # Only write on actual state change
+        if prev != bool_value:
+            write_state_change(self.conn, alarm_key, bool_value)
+        else:
+            log.debug("No change for %s (still %s)", alarm_key, bool_value)
+
+    def event_notification(self, event) -> None:
+        log.debug("Event notification: %s", event)
+
+    def status_change_notification(self, status) -> None:
+        log.warning("Subscription status change: %s", status)
 
 
 # ── OPC UA discovery ──────────────────────────────────────────────────────────
@@ -182,7 +224,6 @@ async def discover_alarm_nodes(
             log.warning("Root path '%s' not found: %s", root_path, exc)
             continue
 
-        # Browse DataStructure → ROOMS
         try:
             ds_node = await root_node.get_child(f"{ns_index}:DataStructure")
             rooms_node = await ds_node.get_child(f"{ns_index}:ROOMS")
@@ -193,13 +234,11 @@ async def discover_alarm_nodes(
         room_children = await rooms_node.get_children()
         for room_node in room_children:
             room_name = (await room_node.read_browse_name()).Name
-            log.debug("  Room: %s", room_name)
 
-            # Browse ALARMS under room
             try:
                 alarms_node = await room_node.get_child(f"{ns_index}:ALARMS")
             except Exception:
-                log.debug("  No ALARMS under room %s", room_name)
+                log.debug("No ALARMS under room %s", room_name)
                 continue
 
             alarm_children = await alarms_node.get_children()
@@ -217,79 +256,82 @@ async def discover_alarm_nodes(
                         "root_path": root_path,
                     }
                 )
-                log.debug("    Alarm: %s → %s", alarm_key, nodeid)
 
     log.info("Discovered %d alarm nodes across %d root path(s)", len(discovered), len(root_paths))
     return discovered
 
 
-# ── Single poll cycle ─────────────────────────────────────────────────────────
+# ── Connection + subscription cycle ──────────────────────────────────────────
 
-async def poll_once(
+async def run_subscription(
     endpoint: str,
     username: str,
     password: str,
     alarm_nodes: list[dict],
     conn: sqlite3.Connection,
+    publishing_interval: float = 500,  # ms
 ) -> None:
-    """Run opcua_read.py as subprocess (clean process = no socket leaks)."""
-    import subprocess, json as _json
-
-    alarm_nodeids = [n["nodeid"] for n in alarm_nodes]
+    """
+    Connect, subscribe to all alarm nodes, and run until disconnected.
+    Raises on connection failure so the caller can reconnect.
+    """
     node_map = {n["nodeid"]: n for n in alarm_nodes}
+    handler = AlarmSubscriptionHandler(node_map, conn)
 
-    # Find python and opcua_read.py
-    script_dir = Path(__file__).parent
-    read_script = script_dir / "opcua_read.py"
-    python_exe = sys.executable
+    client = Client(url=endpoint, timeout=10)
+    client.session_timeout = 3600000  # 1h — subscriptions keep it alive anyway
+    client._watchdog_intervall = 999999  # noqa: SLF001
+    client.set_user(username)
+    client.set_password(password)
 
-    try:
-        result = subprocess.run(
-            [python_exe, str(read_script), endpoint, username, password, _json.dumps(alarm_nodeids)],
-            capture_output=True, text=True, timeout=30,
-            cwd=str(script_dir),
-        )
-        if result.returncode != 0:
-            log.error("opcua_read.py failed (rc=%d): %s", result.returncode, result.stderr[-300:] if result.stderr else "")
-            return
+    log.info("Connecting to %s ...", endpoint)
+    await client.connect()
+    log.info("Connected — creating subscription (publishing_interval=%sms)", publishing_interval)
 
-        values_dict = _json.loads(result.stdout.strip())
+    subscription = await client.create_subscription(publishing_interval, handler)
 
-    except subprocess.TimeoutExpired:
-        log.error("opcua_read.py timed out after 30s")
-        return
-    except Exception as exc:
-        log.error("Subprocess error: %s", exc)
-        return
+    nodes = [client.get_node(n["nodeid"]) for n in alarm_nodes]
+    monitored_items = await subscription.subscribe_data_change(nodes)
+    log.info("Subscribed to %d alarm nodes — waiting for notifications", len(alarm_nodes))
 
-    # Process values
-    changes = 0
-    for nodeid in alarm_nodeids:
-        value = values_dict.get(nodeid)
-        node_info = node_map[nodeid]
-        alarm_key = node_info["alarm_key"]
-
-        if value is None:
-            continue
+    # Also do an initial read to seed current state
+    log.info("Initial state read...")
+    values = await client.read_values(nodes)
+    for i, node_obj in enumerate(alarm_nodes):
+        alarm_key = node_obj["alarm_key"]
+        nodeid = node_obj["nodeid"]
         try:
-            bool_value = bool(value)
+            bool_value = bool(values[i])
         except Exception:
-            log.warning("Cannot convert value for %s: %r", alarm_key, value)
             continue
-
         prev = get_current_state(conn, alarm_key)
-
         if prev != bool_value:
             write_state_change(conn, alarm_key, bool_value)
-            changes += 1
+    log.info("Initial state read complete")
 
-    if changes:
-        log.info("Poll complete — %d state change(s) written", changes)
-    else:
-        log.debug("Poll complete — no changes")
+    # Keep running until the connection drops
+    try:
+        while True:
+            await asyncio.sleep(10)
+            # Lightweight keep-alive check — subscription PublishRequests handle the real keep-alive
+            try:
+                await client.check_connection()
+            except Exception as exc:
+                log.warning("Connection check failed: %s", exc)
+                raise
+    finally:
+        try:
+            await subscription.delete()
+        except Exception:
+            pass
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        log.info("Disconnected")
 
 
-# ── Discovery cycle ───────────────────────────────────────────────────────────
+# ── Discovery helper ──────────────────────────────────────────────────────────
 
 async def discover_and_cache(
     endpoint: str,
@@ -317,7 +359,6 @@ async def discover_and_cache(
             await client.disconnect()
         except Exception:
             pass
-        await asyncio.sleep(2)
         return []
 
     if discovered:
@@ -329,7 +370,6 @@ async def discover_and_cache(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    # Load config
     if not CONFIG_FILE.exists():
         log.error("Config file not found: %s", CONFIG_FILE)
         sys.exit(1)
@@ -342,15 +382,14 @@ async def main() -> None:
     password: str = cfg["server"].get("password", "OPC")
     ns_index: int = cfg.get("namespace", {}).get("index", 2)
     root_paths: list[str] = cfg.get("root_paths", ["SIMULATED"])
-    poll_interval: int = int(cfg.get("alarm", {}).get("poll_interval", 10))
+    publishing_interval: float = float(cfg.get("alarm", {}).get("publishing_interval", 500))
 
-    log.info("Starting OPC UA Poller")
-    log.info("  Endpoint    : %s", endpoint)
-    log.info("  Root paths  : %s", root_paths)
-    log.info("  Poll interval: %ds", poll_interval)
-    log.info("  DB          : %s", DB_FILE)
+    log.info("Starting OPC UA Poller (Subscription mode)")
+    log.info("  Endpoint           : %s", endpoint)
+    log.info("  Root paths         : %s", root_paths)
+    log.info("  Publishing interval: %sms", publishing_interval)
+    log.info("  DB                 : %s", DB_FILE)
 
-    # Init DB
     conn = db_connect()
     ensure_schema(conn)
 
@@ -368,16 +407,26 @@ async def main() -> None:
             log.error("Discovery returned no nodes — check server and root_paths config")
             sys.exit(1)
 
-    log.info("Monitoring %d alarm nodes", len(alarm_nodes))
+    log.info("Monitoring %d alarm nodes via subscription", len(alarm_nodes))
 
-    # Main poll loop
+    # Reconnect loop with exponential backoff
+    backoff = RECONNECT_MIN
     while True:
         try:
-            await poll_once(endpoint, username, password, alarm_nodes, conn)
+            await run_subscription(
+                endpoint, username, password, alarm_nodes, conn, publishing_interval
+            )
+            # If run_subscription returns cleanly (shouldn't happen), reconnect immediately
+            backoff = RECONNECT_MIN
+        except asyncio.CancelledError:
+            log.info("Poller cancelled")
+            break
         except Exception as exc:
-            log.exception("Unexpected error in poll loop: %s", exc)
-
-        await asyncio.sleep(poll_interval)
+            log.error("Connection lost: %s — reconnecting in %ds", exc, backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, RECONNECT_MAX)
+            log.info("Reconnecting...")
+            # Reset backoff after successful reconnect (handled at top of loop)
 
 
 if __name__ == "__main__":
