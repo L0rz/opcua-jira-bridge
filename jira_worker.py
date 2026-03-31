@@ -3,6 +3,12 @@ jira_worker.py — Jira Ticket Sync Worker (NO OPC UA / asyncua)
 
 Polls SQLite for new alarm events and creates/resolves Jira tickets via httpx.
 Runs independently of opcua_poller.py — both share alarms.db.
+
+Flapping alarm behavior (2026-03-31):
+  - Alarm ON + no open ticket → create new Jira ticket
+  - Alarm ON + ticket still open in Jira → add comment only
+  - Alarm OFF → add comment only (ticket stays open for manual resolution)
+  - Before creating a new ticket: verify Jira status of last ticket
 """
 
 import logging
@@ -35,6 +41,9 @@ ENV_FILE = BASE_DIR / ".env"
 load_dotenv(ENV_FILE)
 
 POLL_SLEEP = 5  # seconds between DB polls
+
+# Jira status categories that mean "ticket is done"
+CLOSED_STATUS_CATEGORIES = {"Done"}
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -133,6 +142,27 @@ def mark_event_resolved(conn: sqlite3.Connection, event_id: int) -> None:
     conn.commit()
 
 
+def mark_event_superseded(conn: sqlite3.Connection, alarm_key: str, new_ticket_key: str) -> None:
+    """Mark old ticket_created events as superseded when a new ticket replaces them."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE alarm_events SET status='superseded', processed_at=? "
+        "WHERE alarm_key=? AND status='ticket_created'",
+        (now, alarm_key),
+    )
+    conn.commit()
+
+
+def mark_event_commented(conn: sqlite3.Connection, event_id: int, ticket_key: str) -> None:
+    """Mark an event as handled via comment (no new ticket created)."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE alarm_events SET status='commented', ticket_key=?, processed_at=? WHERE id=?",
+        (ticket_key, now, event_id),
+    )
+    conn.commit()
+
+
 def mark_event_ignored(conn: sqlite3.Connection, event_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
@@ -184,6 +214,56 @@ class JiraClient:
 
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
+
+    def add_comment(self, ticket_key: str, comment: str) -> bool:
+        """Add a comment to an existing Jira ticket."""
+        try:
+            resp = self._client.post(
+                self._url(f"/rest/api/2/issue/{ticket_key}/comment"),
+                json={"body": comment},
+            )
+            resp.raise_for_status()
+            log.info("Added comment to %s", ticket_key)
+            return True
+        except httpx.HTTPStatusError as exc:
+            log.error(
+                "Jira add_comment failed (%s) on %s: %s",
+                exc.response.status_code,
+                ticket_key,
+                exc.response.text[:300],
+            )
+            return False
+        except Exception as exc:
+            log.error("Jira add_comment error for %s: %s", ticket_key, exc)
+            return False
+
+    def get_ticket_status(self, ticket_key: str) -> str | None:
+        """Get the status category name of a Jira ticket.
+
+        Returns the statusCategory name (e.g. 'To Do', 'In Progress', 'Done')
+        or None if the request fails.
+        """
+        try:
+            resp = self._client.get(
+                self._url(f"/rest/api/2/issue/{ticket_key}"),
+                params={"fields": "status"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            status_category = data["fields"]["status"]["statusCategory"]["name"]
+            log.debug("Ticket %s status category: %s", ticket_key, status_category)
+            return status_category
+        except httpx.HTTPStatusError as exc:
+            log.error(
+                "Jira get_ticket_status failed (%s) for %s: %s",
+                exc.response.status_code,
+                ticket_key,
+                exc.response.text[:300],
+            )
+            return None
+        except Exception as exc:
+            log.error("Jira get_ticket_status error for %s: %s", ticket_key, exc)
+            return None
 
     def create_ticket(
         self,
@@ -248,7 +328,11 @@ class JiraClient:
             return None
 
     def resolve_ticket(self, ticket_key: str, comment: str | None = None) -> bool:
-        """Transition ticket to resolved and optionally add a comment."""
+        """Transition ticket to resolved and optionally add a comment.
+
+        Note: This method is retained for manual/explicit use but is no longer
+        called automatically. Tickets are left open for manual resolution.
+        """
         if not self.auto_resolve:
             log.info("Auto-resolve disabled — skipping %s", ticket_key)
             return False
@@ -256,13 +340,7 @@ class JiraClient:
         # Add comment first
         resolve_comment = comment or self.resolve_comment
         if resolve_comment:
-            try:
-                self._client.post(
-                    self._url(f"/rest/api/2/issue/{ticket_key}/comment"),
-                    json={"body": resolve_comment},
-                )
-            except Exception as exc:
-                log.warning("Failed to add comment to %s: %s", ticket_key, exc)
+            self.add_comment(ticket_key, resolve_comment)
 
         # Transition
         payload = {"transition": {"id": self.resolve_transition_id}}
@@ -305,26 +383,48 @@ def process_new_events(
     for event in events:
         alarm_key = event["alarm_key"]
         event_id = event["id"]
+        timestamp = event["created_at"]
 
-        # Dedup check: is there already an open ticket for this alarm?
+        # Check if there's already an open ticket in the DB for this alarm
         open_ticket = get_open_ticket_for_alarm(conn, alarm_key)
-        if open_ticket:
-            log.info(
-                "Dedup: alarm %s already has open ticket %s — ignoring event %d",
-                alarm_key,
-                open_ticket,
-                event_id,
-            )
-            mark_event_ignored(conn, event_id)
-            continue
 
-        # Get node metadata for rich ticket content
+        if open_ticket:
+            # Verify the ticket is actually still open in Jira
+            status_category = jira.get_ticket_status(open_ticket)
+
+            if status_category and status_category in CLOSED_STATUS_CATEGORIES:
+                # Ticket was closed/resolved in Jira — mark old events as superseded
+                # and create a new ticket
+                log.info(
+                    "Ticket %s for alarm %s is closed in Jira (status: %s) — creating new ticket",
+                    open_ticket,
+                    alarm_key,
+                    status_category,
+                )
+                mark_event_superseded(conn, alarm_key, open_ticket)
+                # Fall through to create a new ticket below
+            else:
+                # Ticket is still open in Jira — just add a comment
+                comment = (
+                    f"⚠️ Alarm erneut ausgelöst: {alarm_key} um {timestamp}"
+                )
+                success = jira.add_comment(open_ticket, comment)
+                if success:
+                    mark_event_commented(conn, event_id, open_ticket)
+                else:
+                    log.warning(
+                        "Failed to add comment to %s for event %d — will retry",
+                        open_ticket,
+                        event_id,
+                    )
+                continue
+
+        # No open ticket (or previous one was closed) — create a new one
         node_info = get_node_info(conn, alarm_key)
         label = node_info["label"] if node_info else alarm_key.split(".")[-1]
         room_name = node_info["room_name"] if node_info else None
         root_path = node_info["root_path"] if node_info else None
 
-        # Create Jira ticket
         ticket_key = jira.create_ticket(
             alarm_key=alarm_key,
             label=label,
@@ -343,6 +443,10 @@ def process_resolved_pending(
     conn: sqlite3.Connection,
     jira: JiraClient,
 ) -> None:
+    """Process alarm-off events: add a comment to the ticket but do NOT resolve it.
+
+    Tickets are left open for manual resolution in Jira.
+    """
     events = fetch_resolved_pending(conn)
     if not events:
         return
@@ -353,23 +457,24 @@ def process_resolved_pending(
         event_id = event["id"]
         alarm_key = event["alarm_key"]
         ticket_key = event["ticket_key"]
+        timestamp = event["created_at"]
 
         if not ticket_key:
             log.warning("Event %d has no ticket_key — marking resolved directly", event_id)
             mark_event_resolved(conn, event_id)
             continue
 
+        # Add comment about alarm going away — but do NOT resolve/close the ticket
         comment = (
-            f"Alarm automatically resolved: OPC UA node '{alarm_key}' returned to FALSE. "
-            f"Resolved at {datetime.now(timezone.utc).isoformat()}."
+            f"✅ Alarm zurückgegangen: {alarm_key} um {timestamp}"
         )
 
-        success = jira.resolve_ticket(ticket_key, comment=comment)
+        success = jira.add_comment(ticket_key, comment)
         if success:
             mark_event_resolved(conn, event_id)
         else:
             log.warning(
-                "Failed to resolve ticket %s for event %d — will retry",
+                "Failed to add comment to %s for event %d — will retry",
                 ticket_key,
                 event_id,
             )
