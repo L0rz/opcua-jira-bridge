@@ -236,11 +236,15 @@ class JiraClient:
             log.error("Jira add_comment error for %s: %s", ticket_key, exc)
             return False
 
+    # Sentinel for deleted/not-found tickets
+    TICKET_DELETED = "__DELETED__"
+
     def get_ticket_status(self, ticket_key: str) -> str | None:
         """Get the status category name of a Jira ticket.
 
-        Returns the statusCategory name (e.g. 'To Do', 'In Progress', 'Done')
-        or None if the request fails.
+        Returns the statusCategory name (e.g. 'To Do', 'In Progress', 'Done'),
+        TICKET_DELETED if the ticket was deleted (404),
+        or None if the request fails for other reasons.
         """
         try:
             resp = self._client.get(
@@ -253,6 +257,9 @@ class JiraClient:
             log.debug("Ticket %s status category: %s", ticket_key, status_category)
             return status_category
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                log.warning("Ticket %s not found (deleted?) — treating as closed", ticket_key)
+                return self.TICKET_DELETED
             log.error(
                 "Jira get_ticket_status failed (%s) for %s: %s",
                 exc.response.status_code,
@@ -391,7 +398,7 @@ def process_new_events(
             # Verify the ticket is actually still open in Jira
             status_category = jira.get_ticket_status(open_ticket)
 
-            if status_category and status_category in CLOSED_STATUS_CATEGORIES:
+            if status_category and (status_category in CLOSED_STATUS_CATEGORIES or status_category == JiraClient.TICKET_DELETED):
                 # Ticket was closed/resolved in Jira — mark old events as superseded
                 # and create a new ticket
                 log.info(
@@ -460,6 +467,13 @@ def process_resolved_pending(
 
         if not ticket_key:
             log.warning("Event %d has no ticket_key — marking resolved directly", event_id)
+            mark_event_resolved(conn, event_id)
+            continue
+
+        # Check if the ticket still exists before trying to comment
+        status_category = jira.get_ticket_status(ticket_key)
+        if status_category == JiraClient.TICKET_DELETED:
+            log.info("Ticket %s was deleted — marking event %d as resolved", ticket_key, event_id)
             mark_event_resolved(conn, event_id)
             continue
 
@@ -567,4 +581,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
