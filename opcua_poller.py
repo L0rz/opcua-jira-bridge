@@ -313,13 +313,19 @@ async def run_subscription(
     log.info("Initial state read complete")
 
     # Keep running until the connection drops or we get cancelled (Ctrl+C)
+    heartbeat_count = 0
     try:
         while True:
-            await asyncio.sleep(10)
+            await asyncio.sleep(30)
+            heartbeat_count += 1
+
+            # Active keep-alive: read server status node to force traffic
             try:
-                await client.check_connection()
+                server_state = await client.nodes.server_state.read_value()
+                if heartbeat_count % 10 == 0:  # Log every ~5 min
+                    log.info("♥ Connection alive (server state: %s, uptime: %d checks)", server_state, heartbeat_count)
             except Exception as exc:
-                log.warning("Connection check failed: %s", exc)
+                log.warning("Keep-alive read failed: %s", exc)
                 raise
     except asyncio.CancelledError:
         log.info("Shutdown requested — disconnecting cleanly...")
@@ -458,5 +464,6 @@ if __name__ == "__main__":
     finally:
         loop.close()
         log.info("Poller stopped")
+
 
 
