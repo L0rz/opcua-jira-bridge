@@ -426,12 +426,17 @@ def main() -> None:
 
             if values is None:
                 consecutive_errors += 1
-                if consecutive_errors <= 2:
-                    wait = poll_interval  # first 2 fails: wait normal interval
+                if consecutive_errors == 1:
+                    wait = poll_interval  # first fail: normal wait
                 else:
-                    wait = 120  # server is probably blocking — cooldown 2 min
+                    # Server is blocking — cool down 3 minutes, then reset
+                    wait = 180
+                    log.info("Server appears blocked — cooling down for %ds before resuming", wait)
                 log.warning("Poll failed (%d consecutive) — retrying in %ds", consecutive_errors, wait)
                 time.sleep(wait)
+                if consecutive_errors >= 2:
+                    consecutive_errors = 0  # reset after cooldown — fresh start
+                    log.info("Cooldown complete — resuming normal polling")
                 continue
 
             consecutive_errors = 0
@@ -466,3 +471,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
