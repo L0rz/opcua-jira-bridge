@@ -35,8 +35,8 @@ DB_FILE = BASE_DIR / "alarms.db"
 # Defaults
 DEFAULT_POLL_INTERVAL = 30
 DEFAULT_DEBOUNCE_SECONDS = 30
-RECONNECT_MIN = 10
-RECONNECT_MAX = 120
+RECONNECT_MIN = 300   # 5 min — give E3 server time to clean up zombie sessions
+RECONNECT_MAX = 600   # 10 min max
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -207,7 +207,7 @@ class DebounceTracker:
 
 def create_client(endpoint: str, username: str, password: str) -> Client:
     client = Client(endpoint, timeout=10)
-    client.session_timeout = 3600000  # request 1h (server may revise down)
+    client.session_timeout = 86400000  # request 24h — never timeout if possible
     client.set_user(username)
     client.set_password(password)
     return client
@@ -332,23 +332,18 @@ def main() -> None:
                 if current is not None:
                     debounce.seed(node["alarm_key"], current)
 
-            # Inner poll loop — runs until connection drops or session needs refresh
+            # Inner poll loop — runs until connection dies
+            # NEVER proactively disconnect — each disconnect poisons the E3 server
             poll_count = 0
             session_start = time.monotonic()
-            session_max_age = 540  # reconnect after 9 min (server timeout ~10 min)
 
             while True:
                 poll_count += 1
 
-                # Proactive reconnect before server kills session
-                session_age = time.monotonic() - session_start
-                if session_age > session_max_age:
-                    log.info("Session age %.0fs > %ds — proactive reconnect", session_age, session_max_age)
-                    break  # exit to reconnect loop
-
                 values = read_all_values(client, alarm_nodeids)
                 if values is None:
-                    log.warning("Read failed — connection may be dead, reconnecting...")
+                    session_age = time.monotonic() - session_start
+                    log.warning("Read failed after %.0fs — connection dead, will reconnect", session_age)
                     break  # exit to reconnect loop
 
                 # Feed into debounce
@@ -367,30 +362,22 @@ def main() -> None:
 
                 # Heartbeat every 10 polls
                 if poll_count % 10 == 0:
-                    log.info("♥ Poll #%d OK (session age: %.0fs) — %d pending debounce",
+                    session_age = time.monotonic() - session_start
+                    log.info("♥ Poll #%d OK (session: %.0fs) — %d pending debounce",
                              poll_count, session_age, debounce.pending_count)
 
                 time.sleep(poll_interval)
 
         except KeyboardInterrupt:
-            log.info("Shutting down...")
-            try:
-                client.disconnect()
-                log.info("Disconnected cleanly")
-            except Exception:
-                pass
+            log.info("Shutting down (not disconnecting — E3 cleans up on its own)...")
             break
 
         except Exception as exc:
-            log.error("Connection error: %s — reconnecting in %ds", exc, backoff)
+            log.error("Connection error: %s", exc)
 
-        # Cleanup before reconnect
-        try:
-            client.disconnect()
-        except Exception:
-            pass
-
-        log.info("Waiting %ds before reconnect...", backoff)
+        # DO NOT call client.disconnect() — it creates SecureStream_Delete errors
+        # that poison the E3 server. Just drop the connection and wait.
+        log.info("Waiting %ds for server to clean up before reconnect...", backoff)
         time.sleep(backoff)
         backoff = min(backoff * 2, RECONNECT_MAX)
 
@@ -399,4 +386,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
