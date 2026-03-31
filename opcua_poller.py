@@ -316,13 +316,14 @@ async def run_subscription(
     alarm_nodes: list[dict],
     conn: sqlite3.Connection,
     publishing_interval: float = 500,  # ms
+    debounce_seconds: float = DEBOUNCE_SECONDS,
 ) -> None:
     """
     Connect, subscribe to all alarm nodes, and run until disconnected.
     Raises on connection failure so the caller can reconnect.
     """
     node_map = {n["nodeid"]: n for n in alarm_nodes}
-    handler = AlarmSubscriptionHandler(node_map, conn)
+    handler = AlarmSubscriptionHandler(node_map, conn, debounce_seconds=debounce_seconds)
 
     client = Client(url=endpoint, timeout=10)
     client.session_timeout = 3600000  # 1h — subscriptions keep it alive anyway
@@ -354,7 +355,7 @@ async def run_subscription(
             write_state_change(conn, alarm_key, bool_value)
         # Seed the handler's committed state so debounce knows current baseline
         handler._committed_state[alarm_key] = bool_value if prev is None else (bool_value if prev != bool_value else prev)
-    log.info("Initial state read complete — debounce=%ds", DEBOUNCE_SECONDS)
+    log.info("Initial state read complete — debounce=%ds", debounce_seconds)
 
     # Main loop: flush debounced events + keep-alive
     heartbeat_count = 0
@@ -450,11 +451,13 @@ async def main() -> None:
     ns_index: int = cfg.get("namespace", {}).get("index", 2)
     root_paths: list[str] = cfg.get("root_paths", ["SIMULATED"])
     publishing_interval: float = float(cfg.get("alarm", {}).get("publishing_interval", 500))
+    debounce_seconds: float = float(cfg.get("alarm", {}).get("debounce_seconds", DEBOUNCE_SECONDS))
 
     log.info("Starting OPC UA Poller (Subscription mode)")
     log.info("  Endpoint           : %s", endpoint)
     log.info("  Root paths         : %s", root_paths)
     log.info("  Publishing interval: %sms", publishing_interval)
+    log.info("  Debounce           : %ss", debounce_seconds)
     log.info("  DB                 : %s", DB_FILE)
 
     conn = db_connect()
@@ -481,7 +484,7 @@ async def main() -> None:
     while True:
         try:
             await run_subscription(
-                endpoint, username, password, alarm_nodes, conn, publishing_interval
+                endpoint, username, password, alarm_nodes, conn, publishing_interval, debounce_seconds
             )
             # If run_subscription returns cleanly (shouldn't happen), reconnect immediately
             backoff = RECONNECT_MIN
@@ -516,6 +519,7 @@ if __name__ == "__main__":
     finally:
         loop.close()
         log.info("Poller stopped")
+
 
 
 
