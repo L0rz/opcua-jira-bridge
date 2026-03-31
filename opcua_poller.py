@@ -325,9 +325,11 @@ async def run_subscription(
     node_map = {n["nodeid"]: n for n in alarm_nodes}
     handler = AlarmSubscriptionHandler(node_map, conn, debounce_seconds=debounce_seconds)
 
-    client = Client(url=endpoint, timeout=10)
-    client.session_timeout = 3600000  # 1h — subscriptions keep it alive anyway
-    client._watchdog_intervall = 999999  # noqa: SLF001
+    client = Client(url=endpoint, timeout=15)
+    client.session_timeout = 60000  # 60s — server will revise if needed
+    # Watchdog sends automatic keep-alive reads at this interval (in seconds)
+    # Must be shorter than the server's session timeout (~30s)
+    client._watchdog_intervall = 10  # noqa: SLF001
     client.set_user(username)
     client.set_password(password)
 
@@ -519,6 +521,7 @@ if __name__ == "__main__":
     finally:
         loop.close()
         log.info("Poller stopped")
+
 
 
 
