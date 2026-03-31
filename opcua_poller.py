@@ -32,6 +32,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("poller")
 
+# Suppress noisy asyncua debug/info output
+logging.getLogger("asyncua").setLevel(logging.WARNING)
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "opcua_config_real_server.yaml"
@@ -434,3 +437,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         log.info("Poller stopped by user")
+
