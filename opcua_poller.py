@@ -1,17 +1,19 @@
 """
-opcua_poller.py — OPC UA Alarm Poller via Subscriptions (NO Jira/httpx)
+opcua_poller.py — OPC UA Alarm Poller with Debounce (NO Jira/httpx)
 
-Connects to OPC UA server, discovers alarm nodes, subscribes to DataChange
-notifications, and writes state changes to SQLite (shared with jira_worker.py).
+Connects per poll cycle via subprocess (opcua_read.py), reads all alarm nodes,
+applies debounce, and writes stable state changes to SQLite.
 
-Subscriptions keep the session alive — no more 30s timeout / rate-limiting.
-Auto-reconnects on connection loss with exponential backoff.
+The subprocess approach ensures clean socket teardown every cycle —
+Elipse E3 doesn't support long-lived sessions.
 """
 
 import asyncio
+import json as _json
 import logging
 import platform
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -19,7 +21,6 @@ from pathlib import Path
 
 import yaml
 from asyncua import Client, ua
-from asyncua.common.subscription import DataChangeNotif
 
 # ── Windows event loop fix ────────────────────────────────────────────────────
 if platform.system() == "Windows":
@@ -33,7 +34,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("poller")
 
-# Suppress noisy asyncua debug/info output
 logging.getLogger("asyncua").setLevel(logging.WARNING)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -41,12 +41,9 @@ BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "opcua_config_real_server.yaml"
 DB_FILE = BASE_DIR / "alarms.db"
 
-# Reconnect backoff: starts at 5s, doubles up to 60s
-RECONNECT_MIN = 5
-RECONNECT_MAX = 60
-
-# Debounce: alarm must be stable for this many seconds before writing to DB
-DEBOUNCE_SECONDS = 30
+# Defaults
+DEFAULT_POLL_INTERVAL = 30  # seconds between polls
+DEFAULT_DEBOUNCE_SECONDS = 30  # alarm must be stable this long
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -129,7 +126,6 @@ def write_state_change(
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
 
-    # Update alarm_state
     conn.execute(
         """INSERT INTO alarm_state (alarm_key, current_value, last_changed, open_ticket_key)
            VALUES (?, ?, ?, NULL)
@@ -140,14 +136,12 @@ def write_state_change(
     )
 
     if new_value:
-        # Alarm triggered → new event for jira_worker
         conn.execute(
             "INSERT INTO alarm_events (alarm_key, value, status, created_at) VALUES (?,?,?,?)",
             (alarm_key, True, "new", now),
         )
         log.info("ALARM ON  : %s → new event inserted", alarm_key)
     else:
-        # Alarm cleared → mark open ticket as resolved_pending if exists
         open_row = conn.execute(
             "SELECT id, ticket_key FROM alarm_events "
             "WHERE alarm_key=? AND status='ticket_created' "
@@ -171,53 +165,35 @@ def write_state_change(
     conn.commit()
 
 
-# ── Subscription handler ──────────────────────────────────────────────────────
+# ── Debounce tracker ──────────────────────────────────────────────────────────
 
-class AlarmSubscriptionHandler:
-    """Handles DataChange notifications with debounce.
-
-    An alarm must stay in a new state for DEBOUNCE_SECONDS before it's
-    written to the DB. This prevents flapping alarms from flooding the DB
-    with events every ~5 seconds.
+class DebounceTracker:
+    """Tracks alarm values and only commits changes after they are stable
+    for debounce_seconds.
     """
 
-    def __init__(self, node_map: dict[str, dict], conn: sqlite3.Connection, debounce_seconds: float = DEBOUNCE_SECONDS) -> None:
-        self.node_map = node_map
-        self.conn = conn
+    def __init__(self, debounce_seconds: float) -> None:
         self.debounce_seconds = debounce_seconds
-        # alarm_key → {"value": bool, "since": timestamp}
-        # Tracks the last raw value received and when it first appeared
+        # alarm_key → {"value": bool, "since": monotonic timestamp}
         self._pending: dict[str, dict] = {}
-        self._committed_state: dict[str, bool] = {}  # last value written to DB
+        # alarm_key → last committed value
+        self._committed: dict[str, bool] = {}
 
-    def datachange_notification(self, node, val, data: DataChangeNotif) -> None:
-        nodeid = node.nodeid.to_string()
-        node_info = self.node_map.get(nodeid)
-        if node_info is None:
-            return
-
-        alarm_key = node_info["alarm_key"]
-
-        try:
-            bool_value = bool(val)
-        except Exception:
-            return
-
-        now = time.monotonic()
+    def update(self, alarm_key: str, value: bool) -> None:
+        """Record a new reading. Does not write to DB."""
         pending = self._pending.get(alarm_key)
 
-        if pending is None or pending["value"] != bool_value:
-            # New state or first notification — start debounce timer
-            self._pending[alarm_key] = {"value": bool_value, "since": now}
-            if pending is not None:
-                log.debug("Debounce reset: %s → %s (was %s for %.1fs)",
-                          alarm_key, bool_value, pending["value"], now - pending["since"])
-        # If same value, just let the timer continue
+        if pending is None or pending["value"] != value:
+            # Value changed — reset debounce timer
+            self._pending[alarm_key] = {"value": value, "since": time.monotonic()}
+        # Same value — timer keeps ticking
 
-    def flush_debounced(self) -> int:
-        """Check all pending values and write those that have been stable long enough.
-        Returns number of state changes written.
-        """
+    def flush(self, conn: sqlite3.Connection) -> int:
+        """Write values that have been stable for debounce_seconds. Returns count."""
+        if self.debounce_seconds <= 0:
+            # No debounce — write everything immediately
+            return self._flush_all(conn)
+
         now = time.monotonic()
         changes = 0
 
@@ -226,28 +202,76 @@ class AlarmSubscriptionHandler:
             if elapsed < self.debounce_seconds:
                 continue
 
-            bool_value = pending["value"]
-            committed = self._committed_state.get(alarm_key)
+            value = pending["value"]
+            committed = self._committed.get(alarm_key)
 
-            if committed != bool_value:
-                write_state_change(self.conn, alarm_key, bool_value)
-                self._committed_state[alarm_key] = bool_value
+            if committed != value:
+                write_state_change(conn, alarm_key, value)
+                self._committed[alarm_key] = value
                 changes += 1
 
-            # Remove from pending — it's been flushed
             del self._pending[alarm_key]
 
         return changes
 
-    def get_pending_count(self) -> int:
-        """Return number of alarms currently in debounce."""
+    def _flush_all(self, conn: sqlite3.Connection) -> int:
+        """Flush all pending values immediately (debounce=0)."""
+        changes = 0
+        for alarm_key, pending in list(self._pending.items()):
+            value = pending["value"]
+            committed = self._committed.get(alarm_key)
+
+            if committed != value:
+                write_state_change(conn, alarm_key, value)
+                self._committed[alarm_key] = value
+                changes += 1
+
+            del self._pending[alarm_key]
+
+        return changes
+
+    def seed(self, alarm_key: str, value: bool) -> None:
+        """Set the committed baseline without writing to DB."""
+        self._committed[alarm_key] = value
+
+    @property
+    def pending_count(self) -> int:
         return len(self._pending)
 
-    def event_notification(self, event) -> None:
-        log.debug("Event notification: %s", event)
 
-    def status_change_notification(self, status) -> None:
-        log.warning("Subscription status change: %s", status)
+# ── Subprocess poll ───────────────────────────────────────────────────────────
+
+def poll_via_subprocess(
+    endpoint: str,
+    username: str,
+    password: str,
+    alarm_nodeids: list[str],
+) -> dict[str, bool] | None:
+    """Run opcua_read.py as a subprocess. Returns {nodeid: value} or None on error."""
+    read_script = BASE_DIR / "opcua_read.py"
+    python_exe = sys.executable
+
+    try:
+        result = subprocess.run(
+            [python_exe, str(read_script), endpoint, username, password, _json.dumps(alarm_nodeids)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            cwd=str(BASE_DIR),
+        )
+        if result.returncode != 0:
+            stderr = result.stderr[-300:] if result.stderr else ""
+            log.error("opcua_read.py failed (rc=%d): %s", result.returncode, stderr)
+            return None
+
+        return _json.loads(result.stdout.strip())
+
+    except subprocess.TimeoutExpired:
+        log.error("opcua_read.py timed out after 20s")
+        return None
+    except Exception as exc:
+        log.error("Subprocess error: %s", exc)
+        return None
 
 
 # ── OPC UA discovery ──────────────────────────────────────────────────────────
@@ -257,7 +281,6 @@ async def discover_alarm_nodes(
     root_paths: list[str],
     ns_index: int,
 ) -> list[dict]:
-    """Browse ROOMS/*/ALARMS/* under each root_path and return node descriptors."""
     discovered: list[dict] = []
 
     for root_path in root_paths:
@@ -284,7 +307,6 @@ async def discover_alarm_nodes(
             try:
                 alarms_node = await room_node.get_child(f"{ns_index}:ALARMS")
             except Exception:
-                log.debug("No ALARMS under room %s", room_name)
                 continue
 
             alarm_children = await alarms_node.get_children()
@@ -293,115 +315,17 @@ async def discover_alarm_nodes(
                 nodeid = alarm_node.nodeid.to_string()
                 alarm_key = f"{room_name}.{alarm_name}"
 
-                discovered.append(
-                    {
-                        "nodeid": nodeid,
-                        "alarm_key": alarm_key,
-                        "label": alarm_name,
-                        "room_name": room_name,
-                        "root_path": root_path,
-                    }
-                )
+                discovered.append({
+                    "nodeid": nodeid,
+                    "alarm_key": alarm_key,
+                    "label": alarm_name,
+                    "room_name": room_name,
+                    "root_path": root_path,
+                })
 
     log.info("Discovered %d alarm nodes across %d root path(s)", len(discovered), len(root_paths))
     return discovered
 
-
-# ── Connection + subscription cycle ──────────────────────────────────────────
-
-async def run_subscription(
-    endpoint: str,
-    username: str,
-    password: str,
-    alarm_nodes: list[dict],
-    conn: sqlite3.Connection,
-    publishing_interval: float = 500,  # ms
-    debounce_seconds: float = DEBOUNCE_SECONDS,
-) -> None:
-    """
-    Connect, subscribe to all alarm nodes, and run until disconnected.
-    Raises on connection failure so the caller can reconnect.
-    """
-    node_map = {n["nodeid"]: n for n in alarm_nodes}
-    handler = AlarmSubscriptionHandler(node_map, conn, debounce_seconds=debounce_seconds)
-
-    client = Client(url=endpoint, timeout=15)
-    client.session_timeout = 60000  # 60s — server will revise if needed
-    # Watchdog sends automatic keep-alive reads at this interval (in seconds)
-    # Must be shorter than the server's session timeout (~30s)
-    client._watchdog_intervall = 10  # noqa: SLF001
-    client.set_user(username)
-    client.set_password(password)
-
-    log.info("Connecting to %s ...", endpoint)
-    await client.connect()
-    log.info("Connected — creating subscription (publishing_interval=%sms)", publishing_interval)
-
-    subscription = await client.create_subscription(publishing_interval, handler)
-
-    nodes = [client.get_node(n["nodeid"]) for n in alarm_nodes]
-    monitored_items = await subscription.subscribe_data_change(nodes)
-    log.info("Subscribed to %d alarm nodes — waiting for notifications", len(alarm_nodes))
-
-    # Initial read to seed committed state (bypass debounce for initial sync)
-    log.info("Initial state read...")
-    values = await client.read_values(nodes)
-    for i, node_obj in enumerate(alarm_nodes):
-        alarm_key = node_obj["alarm_key"]
-        try:
-            bool_value = bool(values[i])
-        except Exception:
-            continue
-        prev = get_current_state(conn, alarm_key)
-        if prev != bool_value:
-            write_state_change(conn, alarm_key, bool_value)
-        # Seed the handler's committed state so debounce knows current baseline
-        handler._committed_state[alarm_key] = bool_value if prev is None else (bool_value if prev != bool_value else prev)
-    log.info("Initial state read complete — debounce=%ds", debounce_seconds)
-
-    # Main loop: flush debounced events + keep-alive
-    heartbeat_count = 0
-    try:
-        while True:
-            await asyncio.sleep(5)  # Check debounce every 5s
-            heartbeat_count += 1
-
-            # Flush any debounced state changes
-            flushed = handler.flush_debounced()
-            if flushed:
-                log.info("Debounce flush: %d stable state change(s) written to DB", flushed)
-
-            # Keep-alive every 30s (every 6th iteration)
-            if heartbeat_count % 6 == 0:
-                try:
-                    server_state = await client.nodes.server_state.read_value()
-                    pending = handler.get_pending_count()
-                    if heartbeat_count % 60 == 0:  # Log every ~5 min
-                        log.info("♥ Connection alive (server state: %s, pending debounce: %d, uptime: %d checks)",
-                                 server_state, pending, heartbeat_count)
-                except Exception as exc:
-                    log.warning("Keep-alive read failed: %s", exc)
-                    raise
-    except asyncio.CancelledError:
-        log.info("Shutdown requested — disconnecting cleanly...")
-        raise
-    finally:
-        log.info("Cleaning up OPC UA session...")
-        try:
-            await subscription.delete()
-            log.info("Subscription deleted")
-        except Exception:
-            pass
-        try:
-            await client.disconnect()
-            log.info("Disconnected cleanly from server")
-        except Exception:
-            pass
-        # Give the server a moment to process the disconnect
-        await asyncio.sleep(2)
-
-
-# ── Discovery helper ──────────────────────────────────────────────────────────
 
 async def discover_and_cache(
     endpoint: str,
@@ -433,13 +357,12 @@ async def discover_and_cache(
 
     if discovered:
         save_nodes(conn, discovered)
-
     return discovered
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-async def main() -> None:
+def main() -> None:
     if not CONFIG_FILE.exists():
         log.error("Config file not found: %s", CONFIG_FILE)
         sys.exit(1)
@@ -452,15 +375,15 @@ async def main() -> None:
     password: str = cfg["server"].get("password", "OPC")
     ns_index: int = cfg.get("namespace", {}).get("index", 2)
     root_paths: list[str] = cfg.get("root_paths", ["SIMULATED"])
-    publishing_interval: float = float(cfg.get("alarm", {}).get("publishing_interval", 500))
-    debounce_seconds: float = float(cfg.get("alarm", {}).get("debounce_seconds", DEBOUNCE_SECONDS))
+    poll_interval: int = int(cfg.get("alarm", {}).get("poll_interval", DEFAULT_POLL_INTERVAL))
+    debounce_seconds: float = float(cfg.get("alarm", {}).get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS))
 
-    log.info("Starting OPC UA Poller (Subscription mode)")
-    log.info("  Endpoint           : %s", endpoint)
-    log.info("  Root paths         : %s", root_paths)
-    log.info("  Publishing interval: %sms", publishing_interval)
-    log.info("  Debounce           : %ss", debounce_seconds)
-    log.info("  DB                 : %s", DB_FILE)
+    log.info("Starting OPC UA Poller (subprocess + debounce mode)")
+    log.info("  Endpoint      : %s", endpoint)
+    log.info("  Root paths    : %s", root_paths)
+    log.info("  Poll interval : %ds", poll_interval)
+    log.info("  Debounce      : %ds", debounce_seconds)
+    log.info("  DB            : %s", DB_FILE)
 
     conn = db_connect()
     ensure_schema(conn)
@@ -472,58 +395,71 @@ async def main() -> None:
         log.info("Loaded %d cached alarm nodes from DB", len(alarm_nodes))
     else:
         log.info("No cached nodes — starting discovery...")
-        alarm_nodes = await discover_and_cache(
+        alarm_nodes = asyncio.run(discover_and_cache(
             endpoint, username, password, root_paths, ns_index, conn
-        )
+        ))
         if not alarm_nodes:
             log.error("Discovery returned no nodes — check server and root_paths config")
             sys.exit(1)
 
-    log.info("Monitoring %d alarm nodes via subscription", len(alarm_nodes))
+    alarm_nodeids = [n["nodeid"] for n in alarm_nodes]
+    node_map = {n["nodeid"]: n for n in alarm_nodes}
+    log.info("Monitoring %d alarm nodes", len(alarm_nodes))
 
-    # Reconnect loop with exponential backoff
-    backoff = RECONNECT_MIN
-    while True:
-        try:
-            await run_subscription(
-                endpoint, username, password, alarm_nodes, conn, publishing_interval, debounce_seconds
-            )
-            # If run_subscription returns cleanly (shouldn't happen), reconnect immediately
-            backoff = RECONNECT_MIN
-        except asyncio.CancelledError:
-            log.info("Poller cancelled")
-            break
-        except Exception as exc:
-            log.error("Connection lost: %s — reconnecting in %ds", exc, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, RECONNECT_MAX)
-            log.info("Reconnecting...")
-            # Reset backoff after successful reconnect (handled at top of loop)
+    # Initialize debounce tracker with current DB state
+    debounce = DebounceTracker(debounce_seconds)
+    for node in alarm_nodes:
+        current = get_current_state(conn, node["alarm_key"])
+        if current is not None:
+            debounce.seed(node["alarm_key"], current)
+
+    # Main poll loop
+    consecutive_errors = 0
+    poll_count = 0
+
+    try:
+        while True:
+            poll_count += 1
+
+            # Read all alarm values via subprocess
+            values = poll_via_subprocess(endpoint, username, password, alarm_nodeids)
+
+            if values is None:
+                consecutive_errors += 1
+                wait = min(poll_interval * consecutive_errors, 120)
+                log.warning("Poll failed (%d consecutive) — retrying in %ds", consecutive_errors, wait)
+                time.sleep(wait)
+                continue
+
+            consecutive_errors = 0
+
+            # Feed values into debounce tracker
+            for nodeid, value in values.items():
+                node_info = node_map.get(nodeid)
+                if node_info is None:
+                    continue
+                try:
+                    debounce.update(node_info["alarm_key"], bool(value))
+                except Exception:
+                    pass
+
+            # Flush stable changes to DB
+            flushed = debounce.flush(conn)
+            if flushed:
+                log.info("Debounce flush: %d stable state change(s) written", flushed)
+
+            # Periodic heartbeat log
+            if poll_count % 10 == 0:
+                log.info("♥ Poll #%d — %d pending debounce, %d consecutive OK",
+                         poll_count, debounce.pending_count, poll_count)
+
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        log.info("Poller stopped by user")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
-    import signal
-
-    loop = asyncio.new_event_loop()
-    main_task = loop.create_task(main())
-
-    def _shutdown(sig, frame):
-        log.info("Received %s — shutting down gracefully...", signal.Signals(sig).name)
-        main_task.cancel()
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    try:
-        loop.run_until_complete(main_task)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        loop.close()
-        log.info("Poller stopped")
-
-
-
-
-
-
+    main()
