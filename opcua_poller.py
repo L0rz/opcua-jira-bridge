@@ -1,30 +1,23 @@
 """
-opcua_poller.py — OPC UA Alarm Poller with Debounce (NO Jira/httpx)
+opcua_poller.py — OPC UA Alarm Poller (persistent sync connection + debounce)
 
-Connects per poll cycle via subprocess (opcua_read.py), reads all alarm nodes,
-applies debounce, and writes stable state changes to SQLite.
+Uses python-opcua (sync) with a single persistent connection.
+Elipse E3 doesn't tolerate repeated connect/disconnect cycles (blocks after ~12),
+but persistent connections work indefinitely.
 
-The subprocess approach ensures clean socket teardown every cycle —
-Elipse E3 doesn't support long-lived sessions.
+Reads all alarm nodes periodically, applies debounce, writes stable state changes
+to SQLite (shared with jira_worker.py).
 """
 
-import asyncio
-import json as _json
 import logging
-import platform
 import sqlite3
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
-from asyncua import Client, ua
-
-# ── Windows event loop fix ────────────────────────────────────────────────────
-if platform.system() == "Windows":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+from opcua import Client, ua
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,16 +27,16 @@ logging.basicConfig(
 )
 log = logging.getLogger("poller")
 
-logging.getLogger("asyncua").setLevel(logging.WARNING)
-
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "opcua_config_real_server.yaml"
 DB_FILE = BASE_DIR / "alarms.db"
 
 # Defaults
-DEFAULT_POLL_INTERVAL = 60  # seconds between polls — Elipse E3 blocks after ~10 connects
-DEFAULT_DEBOUNCE_SECONDS = 30  # alarm must be stable this long
+DEFAULT_POLL_INTERVAL = 30
+DEFAULT_DEBOUNCE_SECONDS = 30
+RECONNECT_MIN = 10
+RECONNECT_MAX = 120
 
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
@@ -119,11 +112,7 @@ def get_current_state(conn: sqlite3.Connection, alarm_key: str) -> bool | None:
     return bool(val) if val is not None else None
 
 
-def write_state_change(
-    conn: sqlite3.Connection,
-    alarm_key: str,
-    new_value: bool,
-) -> None:
+def write_state_change(conn: sqlite3.Connection, alarm_key: str, new_value: bool) -> None:
     now = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
@@ -168,70 +157,45 @@ def write_state_change(
 # ── Debounce tracker ──────────────────────────────────────────────────────────
 
 class DebounceTracker:
-    """Tracks alarm values and only commits changes after they are stable
-    for debounce_seconds.
-    """
-
     def __init__(self, debounce_seconds: float) -> None:
         self.debounce_seconds = debounce_seconds
-        # alarm_key → {"value": bool, "since": monotonic timestamp}
         self._pending: dict[str, dict] = {}
-        # alarm_key → last committed value
         self._committed: dict[str, bool] = {}
 
     def update(self, alarm_key: str, value: bool) -> None:
-        """Record a new reading. Does not write to DB."""
         pending = self._pending.get(alarm_key)
-
         if pending is None or pending["value"] != value:
-            # Value changed — reset debounce timer
             self._pending[alarm_key] = {"value": value, "since": time.monotonic()}
-        # Same value — timer keeps ticking
 
     def flush(self, conn: sqlite3.Connection) -> int:
-        """Write values that have been stable for debounce_seconds. Returns count."""
         if self.debounce_seconds <= 0:
-            # No debounce — write everything immediately
             return self._flush_all(conn)
 
         now = time.monotonic()
         changes = 0
-
         for alarm_key, pending in list(self._pending.items()):
-            elapsed = now - pending["since"]
-            if elapsed < self.debounce_seconds:
+            if (now - pending["since"]) < self.debounce_seconds:
                 continue
-
             value = pending["value"]
-            committed = self._committed.get(alarm_key)
-
-            if committed != value:
+            if self._committed.get(alarm_key) != value:
                 write_state_change(conn, alarm_key, value)
                 self._committed[alarm_key] = value
                 changes += 1
-
             del self._pending[alarm_key]
-
         return changes
 
     def _flush_all(self, conn: sqlite3.Connection) -> int:
-        """Flush all pending values immediately (debounce=0)."""
         changes = 0
         for alarm_key, pending in list(self._pending.items()):
             value = pending["value"]
-            committed = self._committed.get(alarm_key)
-
-            if committed != value:
+            if self._committed.get(alarm_key) != value:
                 write_state_change(conn, alarm_key, value)
                 self._committed[alarm_key] = value
                 changes += 1
-
             del self._pending[alarm_key]
-
         return changes
 
     def seed(self, alarm_key: str, value: bool) -> None:
-        """Set the committed baseline without writing to DB."""
         self._committed[alarm_key] = value
 
     @property
@@ -239,79 +203,46 @@ class DebounceTracker:
         return len(self._pending)
 
 
-# ── Subprocess poll ───────────────────────────────────────────────────────────
+# ── OPC UA connection ─────────────────────────────────────────────────────────
 
-def poll_via_subprocess(
-    endpoint: str,
-    username: str,
-    password: str,
-    alarm_nodeids: list[str],
-) -> dict[str, bool] | None:
-    """Run opcua_read.py as a subprocess. Returns {nodeid: value} or None on error."""
-    read_script = BASE_DIR / "opcua_read.py"
-    python_exe = sys.executable
-
-    try:
-        result = subprocess.run(
-            [python_exe, str(read_script), endpoint, username, password, _json.dumps(alarm_nodeids)],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            cwd=str(BASE_DIR),
-        )
-        if result.returncode != 0:
-            stderr = result.stderr[-300:] if result.stderr else ""
-            log.error("opcua_read.py failed (rc=%d): %s", result.returncode, stderr)
-            return None
-
-        return _json.loads(result.stdout.strip())
-
-    except subprocess.TimeoutExpired:
-        log.error("opcua_read.py timed out after 20s")
-        return None
-    except Exception as exc:
-        log.error("Subprocess error: %s", exc)
-        return None
+def create_client(endpoint: str, username: str, password: str) -> Client:
+    client = Client(endpoint, timeout=10)
+    client.session_timeout = 600000  # 10 min
+    client.set_user(username)
+    client.set_password(password)
+    return client
 
 
-# ── OPC UA discovery ──────────────────────────────────────────────────────────
-
-async def discover_alarm_nodes(
-    client: Client,
-    root_paths: list[str],
-    ns_index: int,
-) -> list[dict]:
+def discover_alarm_nodes(client: Client, root_paths: list[str], ns_index: int) -> list[dict]:
+    """Browse ROOMS/*/ALARMS/* under each root_path."""
     discovered: list[dict] = []
 
     for root_path in root_paths:
         log.info("Browsing root path: %s", root_path)
         try:
-            root_node = await client.nodes.root.get_child(
-                ["0:Objects", f"{ns_index}:{root_path}"]
-            )
+            objects = client.get_objects_node()
+            root_node = objects.get_child(f"{ns_index}:{root_path}")
         except Exception as exc:
             log.warning("Root path '%s' not found: %s", root_path, exc)
             continue
 
         try:
-            ds_node = await root_node.get_child(f"{ns_index}:DataStructure")
-            rooms_node = await ds_node.get_child(f"{ns_index}:ROOMS")
+            ds_node = root_node.get_child(f"{ns_index}:DataStructure")
+            rooms_node = ds_node.get_child(f"{ns_index}:ROOMS")
         except Exception as exc:
             log.warning("No DataStructure/ROOMS under '%s': %s", root_path, exc)
             continue
 
-        room_children = await rooms_node.get_children()
-        for room_node in room_children:
-            room_name = (await room_node.read_browse_name()).Name
+        for room_node in rooms_node.get_children():
+            room_name = room_node.get_browse_name().Name
 
             try:
-                alarms_node = await room_node.get_child(f"{ns_index}:ALARMS")
+                alarms_node = room_node.get_child(f"{ns_index}:ALARMS")
             except Exception:
                 continue
 
-            alarm_children = await alarms_node.get_children()
-            for alarm_node in alarm_children:
-                alarm_name = (await alarm_node.read_browse_name()).Name
+            for alarm_node in alarms_node.get_children():
+                alarm_name = alarm_node.get_browse_name().Name
                 nodeid = alarm_node.nodeid.to_string()
                 alarm_key = f"{room_name}.{alarm_name}"
 
@@ -327,37 +258,15 @@ async def discover_alarm_nodes(
     return discovered
 
 
-async def discover_and_cache(
-    endpoint: str,
-    username: str,
-    password: str,
-    root_paths: list[str],
-    ns_index: int,
-    conn: sqlite3.Connection,
-) -> list[dict]:
-    client = Client(url=endpoint, timeout=10)
-    client.session_timeout = 30000
-    client._watchdog_intervall = 999999  # noqa: SLF001
-    client.set_user(username)
-    client.set_password(password)
-
+def read_all_values(client: Client, nodeids: list[str]) -> dict[str, bool] | None:
+    """Read all alarm node values in one call. Returns {nodeid: value} or None on error."""
     try:
-        await client.connect()
-        log.info("Connected for discovery")
-        discovered = await discover_alarm_nodes(client, root_paths, ns_index)
-        await client.disconnect()
-        await asyncio.sleep(2)
+        nodes = [client.get_node(nid) for nid in nodeids]
+        values = [n.get_value() for n in nodes]
+        return {nodeids[i]: values[i] for i in range(len(nodeids))}
     except Exception as exc:
-        log.error("Discovery failed: %s", exc)
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-        return []
-
-    if discovered:
-        save_nodes(conn, discovered)
-    return discovered
+        log.error("Read failed: %s", exc)
+        return None
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -378,97 +287,105 @@ def main() -> None:
     poll_interval: int = int(cfg.get("alarm", {}).get("poll_interval", DEFAULT_POLL_INTERVAL))
     debounce_seconds: float = float(cfg.get("alarm", {}).get("debounce_seconds", DEFAULT_DEBOUNCE_SECONDS))
 
-    log.info("Starting OPC UA Poller (subprocess + debounce mode)")
+    log.info("Starting OPC UA Poller (persistent sync connection)")
     log.info("  Endpoint      : %s", endpoint)
     log.info("  Root paths    : %s", root_paths)
     log.info("  Poll interval : %ds", poll_interval)
     log.info("  Debounce      : %ds", debounce_seconds)
     log.info("  DB            : %s", DB_FILE)
 
-    conn = db_connect()
-    ensure_schema(conn)
+    db = db_connect()
+    ensure_schema(db)
 
-    # Load or discover alarm nodes
-    alarm_nodes = load_cached_nodes(conn)
-
-    if alarm_nodes:
-        log.info("Loaded %d cached alarm nodes from DB", len(alarm_nodes))
-    else:
-        log.info("No cached nodes — starting discovery...")
-        alarm_nodes = asyncio.run(discover_and_cache(
-            endpoint, username, password, root_paths, ns_index, conn
-        ))
-        if not alarm_nodes:
-            log.error("Discovery returned no nodes — check server and root_paths config")
-            sys.exit(1)
-
-    alarm_nodeids = [n["nodeid"] for n in alarm_nodes]
-    node_map = {n["nodeid"]: n for n in alarm_nodes}
-    log.info("Monitoring %d alarm nodes", len(alarm_nodes))
-
-    # Initialize debounce tracker with current DB state
+    # Initialize debounce tracker
     debounce = DebounceTracker(debounce_seconds)
-    for node in alarm_nodes:
-        current = get_current_state(conn, node["alarm_key"])
-        if current is not None:
-            debounce.seed(node["alarm_key"], current)
 
-    # Main poll loop
-    consecutive_errors = 0
-    poll_count = 0
+    # Outer reconnect loop
+    backoff = RECONNECT_MIN
 
-    try:
-        while True:
-            poll_count += 1
+    while True:
+        client = create_client(endpoint, username, password)
 
-            # Read all alarm values via subprocess
-            values = poll_via_subprocess(endpoint, username, password, alarm_nodeids)
+        try:
+            log.info("Connecting to %s ...", endpoint)
+            client.connect()
+            log.info("Connected!")
+            backoff = RECONNECT_MIN  # reset on success
 
-            if values is None:
-                consecutive_errors += 1
-                if consecutive_errors == 1:
-                    wait = poll_interval  # first fail: normal wait
-                else:
-                    # Server is blocking — cool down 3 minutes, then reset
-                    wait = 180
-                    log.info("Server appears blocked — cooling down for %ds before resuming", wait)
-                log.warning("Poll failed (%d consecutive) — retrying in %ds", consecutive_errors, wait)
-                time.sleep(wait)
-                if consecutive_errors >= 2:
-                    consecutive_errors = 0  # reset after cooldown — fresh start
-                    log.info("Cooldown complete — resuming normal polling")
-                continue
+            # Load or discover alarm nodes
+            alarm_nodes = load_cached_nodes(db)
+            if not alarm_nodes:
+                log.info("No cached nodes — discovering...")
+                alarm_nodes = discover_alarm_nodes(client, root_paths, ns_index)
+                if not alarm_nodes:
+                    log.error("No alarm nodes found — check config")
+                    sys.exit(1)
+                save_nodes(db, alarm_nodes)
 
-            consecutive_errors = 0
+            alarm_nodeids = [n["nodeid"] for n in alarm_nodes]
+            node_map = {n["nodeid"]: n for n in alarm_nodes}
+            log.info("Monitoring %d alarm nodes", len(alarm_nodes))
 
-            # Feed values into debounce tracker
-            for nodeid, value in values.items():
-                node_info = node_map.get(nodeid)
-                if node_info is None:
-                    continue
-                try:
-                    debounce.update(node_info["alarm_key"], bool(value))
-                except Exception:
-                    pass
+            # Seed debounce with current DB state
+            for node in alarm_nodes:
+                current = get_current_state(db, node["alarm_key"])
+                if current is not None:
+                    debounce.seed(node["alarm_key"], current)
 
-            # Flush stable changes to DB
-            flushed = debounce.flush(conn)
-            if flushed:
-                log.info("Debounce flush: %d stable state change(s) written", flushed)
+            # Inner poll loop — runs until connection drops
+            poll_count = 0
+            while True:
+                poll_count += 1
 
-            # Periodic heartbeat log
-            if poll_count % 10 == 0:
-                log.info("♥ Poll #%d — %d pending debounce, %d consecutive OK",
-                         poll_count, debounce.pending_count, poll_count)
+                values = read_all_values(client, alarm_nodeids)
+                if values is None:
+                    log.warning("Read failed — connection may be dead, reconnecting...")
+                    break  # exit to reconnect loop
 
-            time.sleep(poll_interval)
+                # Feed into debounce
+                for nodeid, value in values.items():
+                    node_info = node_map.get(nodeid)
+                    if node_info:
+                        try:
+                            debounce.update(node_info["alarm_key"], bool(value))
+                        except Exception:
+                            pass
 
-    except KeyboardInterrupt:
-        log.info("Poller stopped by user")
-    finally:
-        conn.close()
+                # Flush stable changes
+                flushed = debounce.flush(db)
+                if flushed:
+                    log.info("Debounce flush: %d stable state change(s) written", flushed)
+
+                # Heartbeat every 10 polls
+                if poll_count % 10 == 0:
+                    log.info("♥ Poll #%d OK — %d pending debounce", poll_count, debounce.pending_count)
+
+                time.sleep(poll_interval)
+
+        except KeyboardInterrupt:
+            log.info("Shutting down...")
+            try:
+                client.disconnect()
+                log.info("Disconnected cleanly")
+            except Exception:
+                pass
+            break
+
+        except Exception as exc:
+            log.error("Connection error: %s — reconnecting in %ds", exc, backoff)
+
+        # Cleanup before reconnect
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+
+        log.info("Waiting %ds before reconnect...", backoff)
+        time.sleep(backoff)
+        backoff = min(backoff * 2, RECONNECT_MAX)
+
+    db.close()
 
 
 if __name__ == "__main__":
     main()
-
