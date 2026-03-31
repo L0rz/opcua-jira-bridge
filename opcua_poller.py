@@ -42,7 +42,7 @@ CONFIG_FILE = BASE_DIR / "opcua_config_real_server.yaml"
 DB_FILE = BASE_DIR / "alarms.db"
 
 # Defaults
-DEFAULT_POLL_INTERVAL = 30  # seconds between polls
+DEFAULT_POLL_INTERVAL = 60  # seconds between polls — Elipse E3 blocks after ~10 connects
 DEFAULT_DEBOUNCE_SECONDS = 30  # alarm must be stable this long
 
 
@@ -426,7 +426,10 @@ def main() -> None:
 
             if values is None:
                 consecutive_errors += 1
-                wait = min(poll_interval * consecutive_errors, 120)
+                if consecutive_errors <= 2:
+                    wait = poll_interval  # first 2 fails: wait normal interval
+                else:
+                    wait = 120  # server is probably blocking — cooldown 2 min
                 log.warning("Poll failed (%d consecutive) — retrying in %ds", consecutive_errors, wait)
                 time.sleep(wait)
                 continue
