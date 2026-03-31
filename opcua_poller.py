@@ -312,26 +312,32 @@ async def run_subscription(
             write_state_change(conn, alarm_key, bool_value)
     log.info("Initial state read complete")
 
-    # Keep running until the connection drops
+    # Keep running until the connection drops or we get cancelled (Ctrl+C)
     try:
         while True:
             await asyncio.sleep(10)
-            # Lightweight keep-alive check — subscription PublishRequests handle the real keep-alive
             try:
                 await client.check_connection()
             except Exception as exc:
                 log.warning("Connection check failed: %s", exc)
                 raise
+    except asyncio.CancelledError:
+        log.info("Shutdown requested — disconnecting cleanly...")
+        raise
     finally:
+        log.info("Cleaning up OPC UA session...")
         try:
             await subscription.delete()
+            log.info("Subscription deleted")
         except Exception:
             pass
         try:
             await client.disconnect()
+            log.info("Disconnected cleanly from server")
         except Exception:
             pass
-        log.info("Disconnected")
+        # Give the server a moment to process the disconnect
+        await asyncio.sleep(2)
 
 
 # ── Discovery helper ──────────────────────────────────────────────────────────
@@ -433,8 +439,24 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    import signal
+
+    loop = asyncio.new_event_loop()
+    main_task = loop.create_task(main())
+
+    def _shutdown(sig, frame):
+        log.info("Received %s — shutting down gracefully...", signal.Signals(sig).name)
+        main_task.cancel()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Poller stopped by user")
+        loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        loop.close()
+        log.info("Poller stopped")
+
 
