@@ -412,7 +412,7 @@ def process_new_events(
             else:
                 # Ticket is still open in Jira — just add a comment
                 comment = (
-                    f"⚠️ Alarm erneut ausgelöst: {alarm_key} um {timestamp}"
+                    f"⚠️ Alarm re-triggered: {alarm_key} at {timestamp}"
                 )
                 success = jira.add_comment(open_ticket, comment)
                 if success:
@@ -479,7 +479,7 @@ def process_resolved_pending(
 
         # Add comment about alarm going away — but do NOT resolve/close the ticket
         comment = (
-            f"✅ Alarm zurückgegangen: {alarm_key} um {timestamp}"
+            f"✅ Alarm cleared: {alarm_key} at {timestamp}"
         )
 
         success = jira.add_comment(ticket_key, comment)
