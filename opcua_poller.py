@@ -27,6 +27,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("poller")
 
+# Suppress noisy opcua library logging
+logging.getLogger("opcua").setLevel(logging.WARNING)
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "opcua_config_real_server.yaml"
@@ -259,11 +262,20 @@ def discover_alarm_nodes(client: Client, root_paths: list[str], ns_index: int) -
 
 
 def read_all_values(client: Client, nodeids: list[str]) -> dict[str, bool] | None:
-    """Read all alarm node values in one call. Returns {nodeid: value} or None on error."""
+    """Read all alarm node values in a single OPC UA request. Returns {nodeid: value} or None."""
     try:
         nodes = [client.get_node(nid) for nid in nodeids]
-        values = [n.get_value() for n in nodes]
-        return {nodeids[i]: values[i] for i in range(len(nodeids))}
+        # Batch read: single request for all 24 nodes
+        results = client.get_values(nodes)
+        return {nodeids[i]: results[i] for i in range(len(nodeids))}
+    except AttributeError:
+        # Fallback if get_values not available in this opcua version
+        try:
+            values = [n.get_value() for n in [client.get_node(nid) for nid in nodeids]]
+            return {nodeids[i]: values[i] for i in range(len(nodeids))}
+        except Exception as exc:
+            log.error("Read failed: %s", exc)
+            return None
     except Exception as exc:
         log.error("Read failed: %s", exc)
         return None
@@ -386,5 +398,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
